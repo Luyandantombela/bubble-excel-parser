@@ -28,21 +28,27 @@ def parse_excel():
             file_stream.seek(0)
             df = pd.read_excel(file_stream, engine="openpyxl")
 
+        # 1. Clean and track the headers
         df.columns = [str(col) for col in df.columns]
         headers = list(df.columns)
+        
+        # Explicitly include the index column '0' as the very first header
+        if "0" not in headers:
+            headers.insert(0, "0")
+            
         df_cleaned = df.fillna("")
 
-        # --- THE SIMPLE SEPARATOR ---
-        # Joins every single cell value in the spreadsheet using a simple '|'
-        all_cells = []
-        for _, row in df_cleaned.iterrows():
-            for val in row:
-                all_cells.append(str(val))
+        # --- THE ROW SEPARATOR FIX ---
+        # Instead of mashing cells flat, we preserve the row lines
+        clean_rows = []
+        for index, row in df_cleaned.iterrows():
+            # Add the row index number (0, 1, 2, 3...) to the front of each line
+            row_values = [str(index + 1)] + [str(val) for val in row]
+            row_string = "|".join(row_values)
+            clean_rows.append(row_string)
 
-        return (
-            jsonify({"headers": headers, "rows_json": "|".join(all_cells)}),
-            200,
-        )
+        # We return rows_json as a list of full sentences instead of a flat string
+        return jsonify({"headers": headers, "rows_json": clean_rows}), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -51,3 +57,4 @@ def parse_excel():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
