@@ -5,13 +5,12 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)  # Allows your Bubble app to fetch data safely
+CORS(app)
 
 
 @app.route("/parse-excel", methods=["POST"])
 def parse_excel():
     try:
-        # Check if an Excel file was sent
         if "file" not in request.files:
             return jsonify({"error": "No file part in the request"}), 400
 
@@ -19,15 +18,31 @@ def parse_excel():
         if file.filename == "":
             return jsonify({"error": "No selected file"}), 400
 
-        # Read the Excel file directly from the upload stream
-        df = pd.read_excel(file)
+        # Read file data directly into memory
+        file_bytes = file.read()
 
-        # Extract headers and clean row data
+        # Try reading as a modern Excel file (.xlsx) first
+        try:
+            df = pd.read_excel(file_bytes, engine="openpyxl")
+        except Exception:
+            # If that fails, fall back to the older Excel format engine (.xls)
+            try:
+                df = pd.read_excel(file_bytes, engine="xlrd")
+            except Exception as engine_error:
+                return (
+                    jsonify(
+                        {
+                            "error": f"Could not determine Excel format. Details: {str(engine_error)}"
+                        }
+                    ),
+                    400,
+                )
+
+        # Extract headers and clean rows
         headers = [str(col) for col in df.columns]
         df_cleaned = df.fillna("")
         rows_list = df_cleaned.to_dict(orient="records")
 
-        # Return structured data back to Bubble
         return (
             jsonify({"headers": headers, "rows_json": json.dumps(rows_list)}),
             200,
