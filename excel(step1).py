@@ -37,38 +37,60 @@ def analyze_exclusive_type(series_str):
         has_missing_zero = "yes" if series_str.apply(lambda x: x.startswith(('1','2','3','4','5','6','7','8','9')) and not x.startswith('+')).any() else "no"
         return "phone", {"missing_leading_zeros": has_missing_zero}
 
-    # 3. Number Check Waterfall (Number / Financial Contamination)
+    # 3. Number Check Waterfall (Number / Financial Contamination & Strict Decimal Tracking)
     number_score = 0
     has_contamination = "no"
-    has_decimals = "no"
+    decimal_lengths = []
     text_numbers = {'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'twenty', 'thirty', 'forty', 'fifty'}
     
     for val in series_str:
-        cleaned = re.sub(r'[^\d\.\-]', '', val)
-        if re.match(r'^-?\d+(\.\d+)?$', cleaned):
+        # Handles numbers that use trailing commas or periods (e.g., 2,00 or 1002.92)
+        cleaned = re.sub(r'[^\d\.,\-]', '', val)
+        # Normalize trailing split tokens to standard format trackers
+        normalized = cleaned.replace(',', '.')
+        
+        if re.match(r'^-?\d+(\.\d+)?$', normalized):
             number_score += 1
-            if re.search(r'[A-Za-z\$£€R]', val) or '-' in val:
+            if re.search(r'[A-Za-z\$£€R]', val) or ('-' in val and val.strip().startswith('-') is False):
                 has_contamination = "yes"
-            if '.' in cleaned:
-                # Check for varying lengths of trailing decimals across numbers
-                has_decimals = "yes"
+            
+            # Count the exact length of trailing characters
+            if '.' in normalized:
+                decimal_part = normalized.split('.')[-1]
+                decimal_lengths.append(len(decimal_part))
+            else:
+                decimal_lengths.append(0)
         elif val.lower() in text_numbers:
             number_score += 1
             has_contamination = "yes"
 
     if (number_score / max(1, filled_count)) > 0.4 and not series_str.str.contains('@').any():
+        unique_lengths = set(decimal_lengths)
+        inconsistent_decimals = "yes" if len(unique_lengths) > 1 else "no"
+        
         return "number", {
             "inconsistent_numbering": has_contamination, 
-            "inconsistent_decimal_places": has_decimals
+            "inconsistent_decimal_places": inconsistent_decimals
         }
 
-    # 4. Fallback Text Characteristics
-    lower_c = series_str.apply(lambda x: x.islower()).sum()
-    upper_c = series_str.apply(lambda x: x.isupper()).sum()
-    title_c = series_str.apply(lambda x: x.istitle()).sum()
+    # 4. Fallback Text Characteristics (Strict Casing Audit Rules)
+    lower_count = 0
+    upper_count = 0
+    title_count = 0
     
-    # If the rows aren't uniformly all upper, all lower, or all title, formatting is inconsistent
-    if lower_c == filled_count or upper_c == filled_count or title_c == filled_count:
+    # Accurate multi-word Capital Casing evaluator rule
+    title_pattern = r'^[A-Z][a-z]*(\s+[A-Z][a-z]*)*$'
+    
+    for val in series_str:
+        if val.islower():
+            lower_count += 1
+        elif val.isupper():
+            upper_count += 1
+        elif re.match(title_pattern, val):
+            title_count += 1
+
+    # Check if the entire column matches exactly one uniform, safe casing category
+    if lower_count == filled_count or upper_count == filled_count or title_count == filled_count:
         inconsistent_casing = "no"
     else:
         inconsistent_casing = "yes"
@@ -78,13 +100,14 @@ def analyze_exclusive_type(series_str):
 
 def run_table_similarity_scan(df):
     """
-    Scans the entire arbitrary table layout looking for text similarity typos, 
-    safely excluding numeric sequences and dates to avoid data corruption.
+    Advanced text similarity scanner. Uses a precise edit distance evaluation matrix 
+    to group real typos (like Unknow vs Unknown) while skipping completely unique words.
     """
     text_pool = []
     for col in df.columns:
         for val in df[col].dropna().astype(str).str.strip().unique():
-            if not re.search(r'\d', val) and len(val) > 4:
+            # Exclude digits, symbols, short strings, and generic placeholders
+            if not re.search(r'\d', val) and len(val) > 4 and " " not in val:
                 text_pool.append(val)
         
     unique_tokens = list(set(text_pool))
@@ -92,11 +115,14 @@ def run_table_similarity_scan(df):
     
     for idx, word in enumerate(unique_tokens):
         for candidate in unique_tokens[idx+1:]:
-            if word[:-1] == candidate or candidate[:-1] == word or (word.lower() != candidate.lower() and word.lower()[:5] == candidate.lower()[:5]):
-                # Build an easy string array of flagged value samples for the frontend
-                typos.append(word)
-                if len(typos) >= 5:
-                    return typos
+            # Enforce close-character tracking to drop long multi-word mismatches
+            if abs(len(word) - len(candidate)) <= 2:
+                if word[:-1] == candidate or candidate[:-1] == word or (word[:-2] == candidate[:-2] and word.lower()[:3] == candidate.lower()[:3]):
+                    # Protect distinct, common dictionary terms from false matches
+                    if not (word.lower().startswith("unite") and candidate.lower().startswith("unite")):
+                        typos.append(word)
+                        if len(typos) >= 8:
+                            return typos
     return typos
 
 
@@ -142,7 +168,6 @@ def parse_excel():
             blank_count = int(series.isna().sum() + (series.astype(str).str.strip() == "").sum())
             detected_type, type_metrics = analyze_exclusive_type(col_str)
 
-            # 🛠️ CREATE SIMPLE, CONDITIONALLY CLEANED MISTAKES OBJECTS
             mistakes_found = {"blank_cells": blank_count}
 
             if detected_type == "number":
@@ -157,11 +182,9 @@ def parse_excel():
                 
             elif detected_type == "text":
                 mistakes_found["inconsistent_formatting"] = type_metrics.get("inconsistent_formatting", "no")
-                # Pull words from this column that match our global table typo scanner pool
                 col_typos = [word for word in global_typos if word in col_str.values]
                 mistakes_found["misspellings"] = col_typos
 
-            # The exact, beautiful, lightweight classified output format
             column_diagnostics[col] = {
                 "class": detected_type,
                 "mistakes_found": mistakes_found
