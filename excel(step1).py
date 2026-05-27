@@ -11,10 +11,15 @@ app = Flask(__name__)
 CORS(app)
 
 def analyze_exclusive_type(series_str):
+    """
+    Scans raw cell character structures blindly on any file uploaded.
+    Forces an exclusive waterfall to ensure a column belongs to exactly ONE topic.
+    """
     filled_count = len(series_str)
     if filled_count == 0:
         return "text", {}
 
+    # 1. Date Check Waterfall (Universal Date Rules)
     date_regexes = [
         r'^\d{4}[-/]\d{2}[-/]\d{2}$',
         r'^\d{2}[-/]\d{2}[-/]\d{2,4}$'
@@ -22,17 +27,20 @@ def analyze_exclusive_type(series_str):
     date_matches = series_str.apply(lambda x: any(re.match(r, x) for r in date_regexes)).sum()
     if (date_matches / max(1, filled_count)) > 0.4:
         unique_masks = series_str.apply(lambda x: re.sub(r'\d', 'X', x)).nunique()
-        has_mixed = 1 if unique_masks > 1 else 0
-        return "date", {"has_mixed_formats": has_mixed}
+        has_mixed = "yes" if unique_masks > 1 else "no"
+        return "date", {"inconsistent_date_formatting": has_mixed}
 
+    # 2. Phone Check Waterfall (Phone Number Spans)
     cleaned_digits = series_str.apply(lambda x: re.sub(r'[\s\-\(\)\+]', '', x))
     phone_matches = cleaned_digits.apply(lambda x: x.isdigit() and (7 <= len(x) <= 15)).sum()
     if (phone_matches / max(1, filled_count)) > 0.4 and not series_str.str.contains('@').any():
-        has_missing_zero = 1 if series_str.apply(lambda x: x.startswith(('1','2','3','4','5','6','7','8','9')) and not x.startswith('+')).any() else 0
-        return "phone", {"has_missing_zeros": has_missing_zero}
+        has_missing_zero = "yes" if series_str.apply(lambda x: x.startswith(('1','2','3','4','5','6','7','8','9')) and not x.startswith('+')).any() else "no"
+        return "phone", {"missing_leading_zeros": has_missing_zero}
 
+    # 3. Number Check Waterfall (Number / Financial Contamination)
     number_score = 0
-    has_contamination = 0
+    has_contamination = "no"
+    has_decimals = "no"
     text_numbers = {'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'twenty', 'thirty', 'forty', 'fifty'}
     
     for val in series_str:
@@ -40,27 +48,39 @@ def analyze_exclusive_type(series_str):
         if re.match(r'^-?\d+(\.\d+)?$', cleaned):
             number_score += 1
             if re.search(r'[A-Za-z\$£€R]', val) or '-' in val:
-                has_contamination = 1
+                has_contamination = "yes"
+            if '.' in cleaned:
+                # Check for varying lengths of trailing decimals across numbers
+                has_decimals = "yes"
         elif val.lower() in text_numbers:
             number_score += 1
-            has_contamination = 1
+            has_contamination = "yes"
 
     if (number_score / max(1, filled_count)) > 0.4 and not series_str.str.contains('@').any():
-        return "number", {"has_contamination": has_contamination}
+        return "number", {
+            "inconsistent_numbering": has_contamination, 
+            "inconsistent_decimal_places": has_decimals
+        }
 
+    # 4. Fallback Text Characteristics
     lower_c = series_str.apply(lambda x: x.islower()).sum()
     upper_c = series_str.apply(lambda x: x.isupper()).sum()
+    title_c = series_str.apply(lambda x: x.istitle()).sum()
     
-    if upper_c > lower_c and upper_c > (filled_count * 0.5):
-        smart_case = "uppercase"
-    elif lower_c > upper_c and lower_c > (filled_count * 0.5):
-        smart_case = "lowercase"
+    # If the rows aren't uniformly all upper, all lower, or all title, formatting is inconsistent
+    if lower_c == filled_count or upper_c == filled_count or title_c == filled_count:
+        inconsistent_casing = "no"
     else:
-        smart_case = "titlecase"
+        inconsistent_casing = "yes"
         
-    return "text", {"smart_case": smart_case}
+    return "text", {"inconsistent_formatting": inconsistent_casing}
+
 
 def run_table_similarity_scan(df):
+    """
+    Scans the entire arbitrary table layout looking for text similarity typos, 
+    safely excluding numeric sequences and dates to avoid data corruption.
+    """
     text_pool = []
     for col in df.columns:
         for val in df[col].dropna().astype(str).str.strip().unique():
@@ -73,10 +93,12 @@ def run_table_similarity_scan(df):
     for idx, word in enumerate(unique_tokens):
         for candidate in unique_tokens[idx+1:]:
             if word[:-1] == candidate or candidate[:-1] == word or (word.lower() != candidate.lower() and word.lower()[:5] == candidate.lower()[:5]):
-                typos.append({"flagged_value": word, "suggested_fix": candidate})
-                if len(typos) >= 8:
+                # Build an easy string array of flagged value samples for the frontend
+                typos.append(word)
+                if len(typos) >= 5:
                     return typos
     return typos
+
 
 @app.route("/parse-excel", methods=["POST"])
 def parse_excel():
@@ -118,80 +140,31 @@ def parse_excel():
                 })
 
             blank_count = int(series.isna().sum() + (series.astype(str).str.strip() == "").sum())
-            detected_type, metrics = analyze_exclusive_type(col_str)
+            detected_type, type_metrics = analyze_exclusive_type(col_str)
 
-            suggested_token = "Unknown"
+            # 🛠️ CREATE SIMPLE, CONDITIONALLY CLEANED MISTAKES OBJECTS
+            mistakes_found = {"blank_cells": blank_count}
+
             if detected_type == "number":
-                suggested_token = "0"
+                mistakes_found["inconsistent_numbering"] = type_metrics.get("inconsistent_numbering", "no")
+                mistakes_found["inconsistent_decimal_places"] = type_metrics.get("inconsistent_decimal_places", "no")
+                
             elif detected_type == "date":
-                suggested_token = "None"
+                mistakes_found["inconsistent_dates_formatting"] = type_metrics.get("inconsistent_date_formatting", "no")
+                
+            elif detected_type == "phone":
+                mistakes_found["missing_leading_zeros"] = type_metrics.get("missing_leading_zeros", "no")
+                
+            elif detected_type == "text":
+                mistakes_found["inconsistent_formatting"] = type_metrics.get("inconsistent_formatting", "no")
+                # Pull words from this column that match our global table typo scanner pool
+                col_typos = [word for word in global_typos if word in col_str.values]
+                mistakes_found["misspellings"] = col_typos
 
+            # The exact, beautiful, lightweight classified output format
             column_diagnostics[col] = {
-                "detected_primary_type": detected_type,
-                "topic_1_empty_cells": {
-                    "user_display_mistakes": f"We scanned this column and found a data gap! {blank_count} completely blank spaces are missing data values.",
-                    "masterx_suggestion": suggested_token,
-                    "user_interactive_choices": {
-                        "input_field_type": "text_entry_box",
-                        "placeholder_examples": ["N/A", "Unknown", "0"]
-                    }
-                },
-                "topic_2_inconsistent_dates": {
-                    "user_display_mistakes": f"Warning! Date formats are mixed up in different structures here (e.g. tracking variations like 04-06-25 alongside 2025/04/14)." if metrics.get("has_mixed_formats", 0) else "Date structure checked.",
-                    "masterx_suggestion": "YYYY-MM-DD",
-                    "user_interactive_choices": {
-                        "dropdown_preselected_default": "YYYY-MM-DD",
-                        "dropdown_menu_options": ["YYYY-MM-DD", "DD-MM-YYYY", "MM-DD-YYYY", "YYYY/MM/DD"]
-                    }
-                },
-                "topic_3_phone_numbers": {
-                    "user_display_mistakes": "Numeric Truncation Error! We found phone number sequences with formatting mistakes or missing leading zeros." if metrics.get("has_missing_zeros", 0) else "Phone number structure verified.",
-                    "masterx_suggestion": "single",
-                    "user_interactive_choices": {
-                        "dropdown_preselected_default": "single",
-                        "dropdown_menu_options": ["single", "mixed"],
-                        "mode_definitions": {
-                            "single": "Single Country Patching: Automatically snaps your country code (+27) onto the front and patches spatial gaps.",
-                            "mixed": "Mixed Countries Patching: For international datasets; forces missing leading zeros without altering country variables."
-                        }
-                    }
-                },
-                "topic_4_text_cleaning": {
-                    "subtopic_1_formatting": {
-                        "user_display_mistakes": "Text formatting habits evaluated. Casing layout variations found.",
-                        "masterx_suggestion": metrics.get("smart_case", "titlecase"),
-                        "user_interactive_choices": {
-                            "selector_ui_type": "radio_buttons",
-                            "choices_array": ["lowercase", "uppercase", "titlecase"]
-                        }
-                    },
-                    "subtopic_2_misspellings": {
-                        "global_table_scan_typos_found": global_typos,
-                        "masterx_suggestion": 1,
-                        "user_interactive_choices": {
-                            "toggle_ui_type": "single_master_checkbox",
-                            "label_text": "Merge and resolve all detected spelling clusters table-wide automatically"
-                        }
-                    }
-                },
-                "topic_5_number_cleaning": {
-                    "subtopic_1_formatting": {
-                        "user_display_mistakes": "Math columns are contaminated! We found symbols (R300), keywords (thirty), or negative signs (-45) typed inside.",
-                        "masterx_suggestion": 1,
-                        "user_interactive_choices": {
-                            "toggle_ui_type": "boolean_switch",
-                            "label_text": "Strip text/currency tokens while protecting mathematical signs (+/-)"
-                        }
-                    },
-                    "subtopic_2_rounder": {
-                        "user_display_mistakes": "Uneven decimal layouts or inconsistent value points discovered across your financial rows.",
-                        "masterx_suggestion": 2,
-                        "user_interactive_choices": {
-                            "input_ui_type": "number_box_or_dropdown",
-                            "precheck_value": 2
-                        }
-                    }
-                }
+                "class": detected_type,
+                "mistakes_found": mistakes_found
             }
 
         df_cleaned = df.fillna("")
