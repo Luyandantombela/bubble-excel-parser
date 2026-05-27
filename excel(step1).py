@@ -29,13 +29,25 @@ def analyze_exclusive_type(series_str):
                 has_invalid = "yes"
                 if clean_val != "": invalid_list.append(clean_val)
             if any(c.isupper() for c in clean_val): has_mixed_case = "yes"
-        return "email", {"invalid_emails": has_invalid, "invalid_emails_desc": "Column contains broken email formats (e.g. missing a domain extension)." if has_invalid == "yes" else "Email formats are valid.", "invalid_email_list": list(set(invalid_list)), "mixed_case_emails": has_mixed_case, "mixed_case_emails_desc": "Emails contain mixed uppercase letters. These should be lowercase." if has_mixed_case == "yes" else "Email casing is uniform."}
+        return "email", {"invalid_emails": has_invalid, "invalid_emails_desc": "Column contains broken email formats.", "invalid_email_list": list(set(invalid_list)), "mixed_case_emails": has_mixed_case, "mixed_case_emails_desc": "Emails contain mixed uppercase letters." if has_mixed_case == "yes" else "Email casing is uniform."}
 
     cleaned_digits = series_str.apply(lambda x: re.sub(r'[\s\-\(\)\+]', '', x))
     phone_matches = cleaned_digits.apply(lambda x: x.isdigit() and (7 <= len(x) <= 15)).sum()
     if (phone_matches / max(1, filled_count)) > 0.4:
-        has_missing_zero = "yes" if series_str.apply(lambda x: x.startswith(('1','2','3','4','5','6','7','8','9')) and not x.startswith('+')).any() else "no"
-        return "phone", {"missing_leading_zeros": has_missing_zero, "desc": "Phone numbers are truncated missing leading zeros." if has_missing_zero == "yes" else "Phone numbers are uniform."}
+        has_issue, issue_desc = "no", "Phone numbers are uniform."
+        for val in series_str:
+            clean_val = val.strip()
+            digits_only = re.sub(r'\D', '', clean_val)
+            if '?' in clean_val or clean_val.isalpha():
+                has_issue, issue_desc = "yes", "Phone numbers contain invalid placeholder text symbols (like '??')."
+                break
+            elif clean_val.startswith(('1','2','3','4','5','6','7','8','9')) and not clean_val.startswith('+'):
+                has_issue, issue_desc = "yes", "Phone numbers are truncated, missing leading zeros."
+                break
+            elif len(digits_only) > 0 and len(digits_only) < 9:
+                has_issue, issue_desc = "yes", "Phone numbers contain broken, short sequences missing digits (e.g., '082-334-455')."
+                break
+        return "phone", {"missing_leading_zeros": has_issue, "desc": issue_desc}
 
     number_score, has_contamination, decimal_lengths = 0, "no", []
     text_numbers = {'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'twenty', 'thirty', 'forty', 'fifty'}
@@ -92,7 +104,6 @@ def parse_excel():
         df = pd.read_csv(io.BytesIO(file.read()), dtype=str) if file.filename.endswith('.csv') else pd.read_excel(io.BytesIO(file.read()), dtype=str)
         df.columns = [str(col).strip() if not str(col).startswith("Unnamed:") else f"Column {i+1}" for i, col in enumerate(df.columns)]
         headers, total_rows, column_diagnostics, layout_shifts = list(df.columns), len(df), {}, []
-        
         duplicate_mask = df.duplicated(keep='first')
         duplicate_indices = [int(idx + 1) for idx, is_dup in enumerate(duplicate_mask) if is_dup]
 
