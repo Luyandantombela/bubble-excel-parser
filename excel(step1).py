@@ -10,16 +10,11 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-def analyze_exclusive_type(series_str, total_rows):
-    """
-    Analyzes cell character structures purely blindly.
-    Enforces a strict waterfall strategy to classify columns into exactly ONE type.
-    """
+def analyze_exclusive_type(series_str):
     filled_count = len(series_str)
     if filled_count == 0:
         return "text", {}
 
-    # 1. Date Check Waterfall (Regex character structure matching)
     date_regexes = [
         r'^\d{4}[-/]\d{2}[-/]\d{2}$',
         r'^\d{2}[-/]\d{2}[-/]\d{2,4}$'
@@ -30,17 +25,15 @@ def analyze_exclusive_type(series_str, total_rows):
         has_mixed = 1 if unique_masks > 1 else 0
         return "date", {"has_mixed_formats": has_mixed}
 
-    # 2. Phone Check Waterfall (Digit spans subject to numeric zero truncation)
     cleaned_digits = series_str.apply(lambda x: re.sub(r'[\s\-\(\)\+]', '', x))
     phone_matches = cleaned_digits.apply(lambda x: x.isdigit() and (7 <= len(x) <= 15)).sum()
-    if (phone_matches / max(1, filled_count)) > 0.5 and not series_str.str.contains('@').any():
+    if (phone_matches / max(1, filled_count)) > 0.4 and not series_str.str.contains('@').any():
         has_missing_zero = 1 if series_str.apply(lambda x: x.startswith(('1','2','3','4','5','6','7','8','9')) and not x.startswith('+')).any() else 0
         return "phone", {"has_missing_zeros": has_missing_zero}
 
-    # 3. Number Check Waterfall (Handles floats, text numbers, currency markers, negative symbols)
     number_score = 0
     has_contamination = 0
-    text_numbers = {'one', 'two', 'three', 'ten', 'twenty', 'thirty', 'forty', 'fifty'}
+    text_numbers = {'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'twenty', 'thirty', 'forty', 'fifty'}
     
     for val in series_str:
         cleaned = re.sub(r'[^\d\.\-]', '', val)
@@ -55,7 +48,6 @@ def analyze_exclusive_type(series_str, total_rows):
     if (number_score / max(1, filled_count)) > 0.4 and not series_str.str.contains('@').any():
         return "number", {"has_contamination": has_contamination}
 
-    # 4. Text Fallback Default
     lower_c = series_str.apply(lambda x: x.islower()).sum()
     upper_c = series_str.apply(lambda x: x.isupper()).sum()
     
@@ -68,45 +60,39 @@ def analyze_exclusive_type(series_str, total_rows):
         
     return "text", {"smart_case": smart_case}
 
-
 def run_table_similarity_scan(df):
-    """
-    Scans the entire table matrix to group textual typo clusters (e.g. Unknow -> Unknown)
-    """
     text_pool = []
     for col in df.columns:
-        text_pool.extend(df[col].dropna().astype(str).str.strip().unique())
+        for val in df[col].dropna().astype(str).str.strip().unique():
+            if not re.search(r'\d', val) and len(val) > 4:
+                text_pool.append(val)
         
     unique_tokens = list(set(text_pool))
     typos = []
     
     for idx, word in enumerate(unique_tokens):
         for candidate in unique_tokens[idx+1:]:
-            if len(word) > 4 and len(candidate) > 4:
-                if word[:-1] == candidate or candidate[:-1] == word or (word.lower() != candidate.lower() and word.lower()[:5] == candidate.lower()[:5]):
-                    typos.append({"flagged_value": word, "suggested_fix": candidate})
-                    if len(typos) >= 8:
-                        return typos
+            if word[:-1] == candidate or candidate[:-1] == word or (word.lower() != candidate.lower() and word.lower()[:5] == candidate.lower()[:5]):
+                typos.append({"flagged_value": word, "suggested_fix": candidate})
+                if len(typos) >= 8:
+                    return typos
     return typos
-
 
 @app.route("/parse-excel", methods=["POST"])
 def parse_excel():
     try:
         if "file" not in request.files:
-            return jsonify({"error": "No file part in the request"}), 400
+            return jsonify({"error": "No file part found in request payload"}), 400
 
         file = request.files["file"]
         if file.filename == "":
-            return jsonify({"error": "No selected file"}), 400
+            return jsonify({"error": "Empty filename uploaded"}), 400
 
-        # Force elements to string directly to capture leading formatting anomalies
         if file.filename.endswith('.csv'):
             df = pd.read_csv(io.BytesIO(file.read()), dtype=str)
         else:
             df = pd.read_excel(io.BytesIO(file.read()), dtype=str)
 
-        # Map header columns exactly as before
         df.columns = [
             str(col).strip() if not str(col).startswith("Unnamed:") else f"Column {i+1}"
             for i, col in enumerate(df.columns)
@@ -124,87 +110,90 @@ def parse_excel():
             col_str = series.dropna().astype(str).str.strip()
             filled_count = len(col_str)
 
-            # Global Table Layout Shift Analyzer
             if total_rows > 5 and filled_count > 0 and (filled_count / total_rows) < 0.15:
                 layout_shifts.append({
                     "column": col,
-                    "error_msg": f"Stray text detected in {col}. Data may have shifted out of bounds.",
+                    "error_msg": f"Stray text detected in {col}. Data layout may have shifted out of standard bounds.",
                     "sample_value": col_str.iloc[0] if len(col_str) > 0 else ""
                 })
 
             blank_count = int(series.isna().sum() + (series.astype(str).str.strip() == "").sum())
-            
-            # Type evaluations
-            detected_type, metrics = analyze_exclusive_type(col_str, total_rows)
+            detected_type, metrics = analyze_exclusive_type(col_str)
 
-            # Define smart type default tokens
             suggested_token = "Unknown"
             if detected_type == "number":
                 suggested_token = "0"
             elif detected_type == "date":
                 suggested_token = "None"
 
-            # Enforce 5 Core Business Topics JSON Schema output
             column_diagnostics[col] = {
                 "detected_primary_type": detected_type,
-                
                 "topic_1_empty_cells": {
-                    "mistake_tracking": {
-                        "empty_cell_count": blank_count,
-                        "has_missing_values": 1 if blank_count > 0 else 0
-                    },
-                    "smart_defaults_and_options": {
-                        "suggested_default_token": suggested_token
+                    "user_display_mistakes": f"We scanned this column and found a data gap! {blank_count} completely blank spaces are missing data values.",
+                    "masterx_suggestion": suggested_token,
+                    "user_interactive_choices": {
+                        "input_field_type": "text_entry_box",
+                        "placeholder_examples": ["N/A", "Unknown", "0"]
                     }
                 },
-                
                 "topic_2_inconsistent_dates": {
-                    "mistake_tracking": {
-                        "is_applicable_date_column": 1 if detected_type == "date" else 0,
-                        "has_mixed_formats": metrics.get("has_mixed_formats", 0)
-                    },
-                    "smart_defaults_and_options": {
-                        "preselected_universal_fallback": "YYYY-MM-DD",
-                        "regional_format_choices": ["YYYY-MM-DD", "DD-MM-YYYY", "MM-DD-YYYY", "YYYY/MM/DD"]
+                    "user_display_mistakes": f"Warning! Date formats are mixed up in different structures here (e.g. tracking variations like 04-06-25 alongside 2025/04/14)." if metrics.get("has_mixed_formats", 0) else "Date structure checked.",
+                    "masterx_suggestion": "YYYY-MM-DD",
+                    "user_interactive_choices": {
+                        "dropdown_preselected_default": "YYYY-MM-DD",
+                        "dropdown_menu_options": ["YYYY-MM-DD", "DD-MM-YYYY", "MM-DD-YYYY", "YYYY/MM/DD"]
                     }
                 },
-                
                 "topic_3_phone_numbers": {
-                    "mistake_tracking": {
-                        "is_applicable_phone_column": 1 if detected_type == "phone" else 0,
-                        "has_truncated_leading_zeros": metrics.get("has_missing_zeros", 0)
-                    },
-                    "smart_defaults_and_options": {
-                        "preselected_mode_configuration": "single",
-                        "mode_choices": ["single", "mixed"]
+                    "user_display_mistakes": "Numeric Truncation Error! We found phone number sequences with formatting mistakes or missing leading zeros." if metrics.get("has_missing_zeros", 0) else "Phone number structure verified.",
+                    "masterx_suggestion": "single",
+                    "user_interactive_choices": {
+                        "dropdown_preselected_default": "single",
+                        "dropdown_menu_options": ["single", "mixed"],
+                        "mode_definitions": {
+                            "single": "Single Country Patching: Automatically snaps your country code (+27) onto the front and patches spatial gaps.",
+                            "mixed": "Mixed Countries Patching: For international datasets; forces missing leading zeros without altering country variables."
+                        }
                     }
                 },
-                
                 "topic_4_text_cleaning": {
                     "subtopic_1_formatting": {
-                        "is_applicable_text_column": 1 if detected_type == "text" else 0,
-                        "prechecked_smart_case_option": metrics.get("smart_case", "titlecase"),
-                        "casing_selector_choices": ["lowercase", "uppercase", "titlecase"]
+                        "user_display_mistakes": "Text formatting habits evaluated. Casing layout variations found.",
+                        "masterx_suggestion": metrics.get("smart_case", "titlecase"),
+                        "user_interactive_choices": {
+                            "selector_ui_type": "radio_buttons",
+                            "choices_array": ["lowercase", "uppercase", "titlecase"]
+                        }
                     },
-                    "subtopic_2_typos": {
+                    "subtopic_2_misspellings": {
                         "global_table_scan_typos_found": global_typos,
-                        "prechecked_master_toggle_clear_all": 1 if len(global_typos) > 0 else 0
+                        "masterx_suggestion": 1,
+                        "user_interactive_choices": {
+                            "toggle_ui_type": "single_master_checkbox",
+                            "label_text": "Merge and resolve all detected spelling clusters table-wide automatically"
+                        }
                     }
                 },
-                
                 "topic_5_number_cleaning": {
-                    "mistake_tracking": {
-                        "is_applicable_number_column": 1 if detected_type == "number" else 0,
-                        "has_contamination_artifacts": metrics.get("has_contamination", 0)
+                    "subtopic_1_formatting": {
+                        "user_display_mistakes": "Math columns are contaminated! We found symbols (R300), keywords (thirty), or negative signs (-45) typed inside.",
+                        "masterx_suggestion": 1,
+                        "user_interactive_choices": {
+                            "toggle_ui_type": "boolean_switch",
+                            "label_text": "Strip text/currency tokens while protecting mathematical signs (+/-)"
+                        }
                     },
-                    "smart_defaults_and_options": {
-                        "strip_formatting_preserve_signs": 1,
-                        "preselected_rounding_uniformity_decimal": 2
+                    "subtopic_2_rounder": {
+                        "user_display_mistakes": "Uneven decimal layouts or inconsistent value points discovered across your financial rows.",
+                        "masterx_suggestion": 2,
+                        "user_interactive_choices": {
+                            "input_ui_type": "number_box_or_dropdown",
+                            "precheck_value": 2
+                        }
                     }
                 }
             }
 
-        # Your exact pipe-delimited output configuration restored
         df_cleaned = df.fillna("")
         clean_rows = []
         for _, row in df_cleaned.iterrows():
