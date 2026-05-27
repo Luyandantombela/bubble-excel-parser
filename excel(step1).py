@@ -13,30 +13,36 @@ except ImportError:
 app = Flask(__name__)
 CORS(app)
 
-# Words that are real but flagged by spellchecker — extend as needed
 CUSTOM_WHITELIST = {
     'joburg', 'pretoria', 'durban', 'bongi', 'tina', 'chris', 'linda',
     'sarah', 'mike', 'amy', 'john', 'todo', 'asdf', 'idk'
 }
 
+
+# ─────────────────────────────────────────────
+# SPELL CHECK  →  returns list of
+# {"original": "wrord", "suggestion": "word"}
+# ─────────────────────────────────────────────
 def find_column_typos(series_str):
     """
-    Detect misspellings using pyspellchecker if available,
-    falling back to frequency-based heuristic detection.
+    Returns a list of dicts: {original, suggestion}.
+    If pyspellchecker is available we get real corrections;
+    otherwise falls back to frequency-based heuristic (no suggestion).
     """
     if SPELLCHECK_AVAILABLE:
         spell = SpellChecker()
-        misspelled_found = set()
+        found = {}          # original → best suggestion
         for val in series_str.dropna().astype(str).str.strip():
             clean_text = re.sub(r'[^a-zA-Z\s]', '', val)
             words = [w.lower() for w in clean_text.split() if len(w) > 2]
             unknown = spell.unknown(words)
             for word in unknown:
-                if word not in CUSTOM_WHITELIST:
-                    misspelled_found.add(word)
-        return list(misspelled_found)
+                if word not in CUSTOM_WHITELIST and word not in found:
+                    correction = spell.correction(word)
+                    found[word] = correction if correction and correction != word else None
+        return [{"original": k, "suggestion": v} for k, v in found.items()]
 
-    # Fallback: frequency-based heuristic
+    # Fallback: frequency-based heuristic (no correction available)
     word_pool = []
     for val in series_str.dropna().astype(str).str.strip():
         clean_text = re.sub(r'[^a-zA-Z\s]', '', val)
@@ -47,18 +53,21 @@ def find_column_typos(series_str):
         return []
     freq_map = pd.Series(word_pool).value_counts().to_dict()
     unique_words = list(freq_map.keys())
-    flagged_anomalies = []
+    flagged = []
     for idx, word in enumerate(unique_words):
         for candidate in unique_words[idx + 1:]:
             if abs(len(word) - len(candidate)) <= 2:
                 if (word[:-1] == candidate or candidate[:-1] == word or
                         (word[:-2] == candidate[:-2] and word[:3] == candidate[:3])):
                     if not (word.startswith("unite") or candidate.startswith("unite")):
-                        rare_word = word if freq_map[word] < freq_map[candidate] else candidate
-                        flagged_anomalies.append(rare_word)
-    return list(set(flagged_anomalies))
+                        rare = word if freq_map[word] < freq_map[candidate] else candidate
+                        flagged.append(rare)
+    return [{"original": w, "suggestion": None} for w in set(flagged)]
 
 
+# ─────────────────────────────────────────────
+# TYPE DETECTION  (unchanged logic, same return)
+# ─────────────────────────────────────────────
 def analyze_exclusive_type(series_str):
     filled_count = len(series_str)
     if filled_count == 0:
@@ -159,6 +168,80 @@ def analyze_exclusive_type(series_str):
     }
 
 
+# ─────────────────────────────────────────────
+# NEW: build the "suggested clean" cell value
+# ─────────────────────────────────────────────
+def suggest_clean_value(val, detected_type, type_metrics, spell_map):
+    """
+    Returns a suggested cleaned string for a single cell value.
+    spell_map: dict {original_lower → suggestion} for this column.
+    """
+    if val is None or str(val).strip() == "":
+        return ""
+
+    s = str(val).strip()
+
+    if detected_type == "text":
+        # Apply spelling corrections
+        words = s.split()
+        corrected = []
+        for w in words:
+            key = re.sub(r'[^a-zA-Z]', '', w).lower()
+            if key in spell_map and spell_map[key]:
+                # Preserve original casing pattern
+                suggestion = spell_map[key]
+                if w.isupper():
+                    suggestion = suggestion.upper()
+                elif w.istitle():
+                    suggestion = suggestion.title()
+                corrected.append(suggestion)
+            else:
+                corrected.append(w)
+        s = " ".join(corrected)
+
+        # Apply casing suggestion: default to Title Case for text
+        if type_metrics.get("inconsistent_formatting") == "yes":
+            s = s.title()
+
+        return s
+
+    if detected_type == "number":
+        # Strip currency symbols and letters, normalise decimals to 2dp
+        cleaned = re.sub(r'[^\d\.\-]', '', s.replace(',', '.'))
+        try:
+            num = float(cleaned)
+            return f"{num:.2f}"
+        except ValueError:
+            return s
+
+    if detected_type == "date":
+        # Attempt to parse and reformat to YYYY/MM/DD
+        for fmt in ('%Y/%m/%d', '%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y',
+                    '%m-%d-%y', '%m/%d/%Y', '%d %b %Y', '%b %d, %Y',
+                    '%m-%d-%Y'):
+            try:
+                import datetime
+                d = datetime.datetime.strptime(s, fmt)
+                return d.strftime('%Y/%m/%d')
+            except ValueError:
+                continue
+        return s
+
+    if detected_type == "email":
+        return s.lower()
+
+    if detected_type == "phone":
+        digits = re.sub(r'\D', '', s)
+        if digits and not s.startswith('+') and len(digits) >= 9:
+            return '0' + digits if not digits.startswith('0') else digits
+        return s
+
+    return s
+
+
+# ─────────────────────────────────────────────
+# MAIN ROUTE
+# ─────────────────────────────────────────────
 @app.route("/parse-excel", methods=["POST"])
 def parse_excel():
     try:
@@ -168,20 +251,38 @@ def parse_excel():
         if file.filename == "":
             return jsonify({"error": "Empty name"}), 400
 
-        df = pd.read_csv(io.BytesIO(file.read()), dtype=str) if file.filename.endswith('.csv') else pd.read_excel(io.BytesIO(file.read()), dtype=str)
-        df.columns = [str(col).strip() if not str(col).startswith("Unnamed:") else f"Column {i+1}" for i, col in enumerate(df.columns)]
+        fname = file.filename.lower()
+        raw = file.read()
 
-        headers = list(df.columns)
-        total_rows = len(df)
+        # Support CSV, XLSX, XLS, ODS, TSV
+        if fname.endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(raw), dtype=str)
+        elif fname.endswith('.tsv'):
+            df = pd.read_csv(io.BytesIO(raw), sep='\t', dtype=str)
+        elif fname.endswith('.ods'):
+            df = pd.read_excel(io.BytesIO(raw), dtype=str, engine='odf')
+        else:
+            df = pd.read_excel(io.BytesIO(raw), dtype=str)
+
+        df.columns = [
+            str(col).strip() if not str(col).startswith("Unnamed:") else f"Column {i+1}"
+            for i, col in enumerate(df.columns)
+        ]
+
+        headers     = list(df.columns)
+        total_rows  = len(df)
         column_diagnostics = {}
-        layout_shifts = []
+        layout_shifts      = []
 
-        duplicate_mask = df.duplicated(keep='first')
+        duplicate_mask    = df.duplicated(keep='first')
         duplicate_indices = [int(idx + 1) for idx, is_dup in enumerate(duplicate_mask) if is_dup]
 
+        # Per-column spell maps so suggest_clean_value can use them
+        spell_maps = {}
+
         for i, col in enumerate(headers):
-            series = df[col]
-            col_str = series.dropna().astype(str).str.strip()
+            series    = df[col]
+            col_str   = series.dropna().astype(str).str.strip()
             filled_count = len(col_str)
 
             if total_rows > 5 and filled_count > 0 and (filled_count / total_rows) < 0.15:
@@ -194,47 +295,80 @@ def parse_excel():
             blank_count = int(series.isna().sum() + (series.astype(str).str.strip() == "").sum())
             detected_type, type_metrics = analyze_exclusive_type(col_str)
 
+            # Spellcheck (text columns only)
+            typos = []
+            spell_map = {}
+            if detected_type == "text":
+                typos = find_column_typos(col_str)
+                spell_map = {t["original"]: t["suggestion"] for t in typos}
+            spell_maps[col] = spell_map
+
             mistakes_found = {
                 "blank_cells": blank_count,
                 "blank_cells_desc": f"Found {blank_count} empty rows missing values." if blank_count > 0 else "No missing values."
             }
 
             if detected_type == "number":
-                mistakes_found["inconsistent_numbering"] = type_metrics.get("inconsistent_numbering", "no")
-                mistakes_found["inconsistent_numbering_desc"] = type_metrics.get("numbering_desc", "")
-                mistakes_found["inconsistent_decimal_places"] = type_metrics.get("inconsistent_decimal_places", "no")
-                mistakes_found["inconsistent_decimal_places_desc"] = type_metrics.get("decimal_desc", "")
+                mistakes_found["inconsistent_numbering"]          = type_metrics.get("inconsistent_numbering", "no")
+                mistakes_found["inconsistent_numbering_desc"]     = type_metrics.get("numbering_desc", "")
+                mistakes_found["inconsistent_decimal_places"]     = type_metrics.get("inconsistent_decimal_places", "no")
+                mistakes_found["inconsistent_decimal_places_desc"]= type_metrics.get("decimal_desc", "")
             elif detected_type == "date":
-                mistakes_found["inconsistent_dates_formatting"] = type_metrics.get("inconsistent_dates_formatting", "no")
+                mistakes_found["inconsistent_dates_formatting"]      = type_metrics.get("inconsistent_date_formatting", "no")
                 mistakes_found["inconsistent_dates_formatting_desc"] = type_metrics.get("desc", "")
             elif detected_type == "phone":
-                mistakes_found["missing_leading_zeros"] = type_metrics.get("missing_leading_zeros", "no")
+                mistakes_found["missing_leading_zeros"]      = type_metrics.get("missing_leading_zeros", "no")
                 mistakes_found["missing_leading_zeros_desc"] = type_metrics.get("desc", "")
             elif detected_type == "email":
-                mistakes_found["invalid_emails"] = type_metrics.get("invalid_emails", "no")
-                mistakes_found["invalid_emails_desc"] = type_metrics.get("invalid_emails_desc", "")
-                mistakes_found["invalid_email_list"] = type_metrics.get("invalid_email_list", [])
-                mistakes_found["mixed_case_emails"] = type_metrics.get("mixed_case_emails", "no")
+                mistakes_found["invalid_emails"]       = type_metrics.get("invalid_emails", "no")
+                mistakes_found["invalid_emails_desc"]  = type_metrics.get("invalid_emails_desc", "")
+                mistakes_found["invalid_email_list"]   = type_metrics.get("invalid_email_list", [])
+                mistakes_found["mixed_case_emails"]    = type_metrics.get("mixed_case_emails", "no")
                 mistakes_found["mixed_case_emails_desc"] = type_metrics.get("mixed_case_emails_desc", "")
             elif detected_type == "text":
-                mistakes_found["inconsistent_formatting"] = type_metrics.get("inconsistent_formatting", "no")
+                mistakes_found["inconsistent_formatting"]      = type_metrics.get("inconsistent_formatting", "no")
                 mistakes_found["inconsistent_formatting_desc"] = type_metrics.get("casing_desc", "")
-                mistakes_found["misspellings"] = find_column_typos(col_str)
+                # NEW: full typo objects with suggestions
+                mistakes_found["misspellings"] = typos
 
-            column_diagnostics[col] = {"class": detected_type, "mistakes_found": mistakes_found}
+            column_diagnostics[col] = {
+                "class": detected_type,
+                "mistakes_found": mistakes_found
+            }
 
+        # ── Build suggested-clean rows ──────────────────────────────────────
+        # Each cell gets the auto-suggested cleaned value.
+        # The frontend will display these as the "preview" the user can override.
+        suggested_rows = []
+        for _, row in df.iterrows():
+            clean_row = {}
+            for col in headers:
+                raw_val = row[col]
+                cd      = column_diagnostics[col]
+                _, tm   = analyze_exclusive_type(
+                    df[col].dropna().astype(str).str.strip()
+                )
+                clean_row[col] = suggest_clean_value(
+                    raw_val,
+                    cd["class"],
+                    tm,
+                    spell_maps[col]
+                )
+            suggested_rows.append(clean_row)
+
+        # Legacy pipe-joined rows (kept for backward compat)
         df_cleaned = df.fillna("")
         clean_rows = ["|".join([str(val) for val in row]) for _, row in df_cleaned.iterrows()]
 
         payload = {
-            "headers": headers,
-            "rows_json": clean_rows,
+            "headers":                headers,
+            "rows_json":              clean_rows,           # raw original, pipe-joined
+            "suggested_rows":         suggested_rows,       # NEW: [{col: cleaned_val, …}, …]
             "layout_alignment_errors": layout_shifts,
-            "duplicate_row_indices": duplicate_indices,
-            "diagnostics": column_diagnostics
+            "duplicate_row_indices":  duplicate_indices,
+            "diagnostics":            column_diagnostics
         }
 
-        # raw_json lets Bubble pass the entire payload as a single text field
         return jsonify({**payload, "raw_json": json.dumps(payload)}), 200
 
     except Exception as e:
