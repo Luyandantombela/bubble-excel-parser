@@ -26,7 +26,7 @@ def analyze_exclusive_type(series_str):
             clean_val = val.strip()
             if not re.match(valid_email_regex, clean_val): has_invalid = "yes"
             if any(c.isupper() for c in clean_val): has_mixed_case = "yes"
-        return "email", {"invalid_emails": has_invalid, "invalid_emails_desc": "Column contains broken email formats (e.g. 'ayanda@' missing a domain standard extension)." if has_invalid == "yes" else "Email formats are valid.", "mixed_case_emails": has_mixed_case, "mixed_case_emails_desc": "Emails contain mixed uppercase letters. These should be lowercase." if has_mixed_case == "yes" else "Email casing is uniform."}
+        return "email", {"invalid_emails": has_invalid, "invalid_emails_desc": "Column contains broken email formats (e.g. missing a domain standard extension)." if has_invalid == "yes" else "Email formats are valid.", "mixed_case_emails": has_mixed_case, "mixed_case_emails_desc": "Emails contain mixed uppercase letters. These should be lowercase." if has_mixed_case == "yes" else "Email casing is uniform."}
 
     cleaned_digits = series_str.apply(lambda x: re.sub(r'[\s\-\(\)\+]', '', x))
     phone_matches = cleaned_digits.apply(lambda x: x.isdigit() and (7 <= len(x) <= 15)).sum()
@@ -117,7 +117,11 @@ def parse_excel():
             elif detected_type == "text":
                 mistakes_found["inconsistent_formatting"] = type_metrics.get("inconsistent_formatting", "no")
                 mistakes_found["inconsistent_formatting_desc"] = type_metrics.get("casing_desc", "")
-                mistakes_found["misspellings"] = [w for w in global_typos if w in col_str.values]
+                
+                # 🛠️ HERE WE GO: Collects only the specific words flagged inside this specific text column
+                col_typos = [w for w in global_typos if w in col_str.values]
+                mistakes_found["misspellings"] = col_typos
+
             column_diagnostics[col] = {"class": detected_type, "mistakes_found": mistakes_found}
 
         df_cleaned = df.fillna("")
