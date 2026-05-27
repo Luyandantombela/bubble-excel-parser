@@ -103,7 +103,8 @@ def parse_excel():
             col_str = series.dropna().astype(str).str.strip()
             filled_count = len(col_str)
             if total_rows > 5 and filled_count > 0 and (filled_count / total_rows) < 0.15:
-                layout_shifts.append({"column": col, "error_msg": f"Stray text boundary shift in {col}.", "sample_value": col_str.iloc if len(col_str) > 0 else ""})
+                # 🛠️ FIXED: Added [0] so it extracts the actual text string instead of a raw indexer object
+                layout_shifts.append({"column": col, "error_msg": f"Stray text boundary shift in {col}.", "sample_value": col_str.iloc[0] if len(col_str) > 0 else ""})
             blank_count = int(series.isna().sum() + (series.astype(str).str.strip() == "").sum())
             detected_type, type_metrics = analyze_exclusive_type(col_str)
             mistakes_found = {"blank_cells": blank_count, "blank_cells_desc": f"Found {blank_count} empty rows missing values." if blank_count > 0 else "No missing values."}
@@ -114,7 +115,7 @@ def parse_excel():
                 mistakes_found["inconsistent_decimal_places"] = type_metrics.get("inconsistent_decimal_places", "no")
                 mistakes_found["inconsistent_decimal_places_desc"] = type_metrics.get("decimal_desc", "")
             elif detected_type == "date":
-                mistakes_found["inconsistent_dates_formatting"] = type_metrics.get("inconsistent_dates_formatting", "no")
+                mistakes_found["inconsistent_dates_formatting"] = type_metrics.get("inconsistent_date_formatting", "no")
                 mistakes_found["inconsistent_dates_formatting_desc"] = type_metrics.get("desc", "")
             elif detected_type == "phone":
                 mistakes_found["missing_leading_zeros"] = type_metrics.get("missing_leading_zeros", "no")
@@ -132,7 +133,7 @@ def parse_excel():
             column_diagnostics[col] = {"class": detected_type, "mistakes_found": mistakes_found}
 
         df_cleaned = df.fillna("")
-        clean_rows = ["| ".join([str(val) for val in row]) for _, row in df_cleaned.iterrows()]
+        clean_rows = ["|".join([str(val) for val in row]) for _, row in df_cleaned.iterrows()]
         return jsonify({"headers": headers, "rows_json": clean_rows, "layout_alignment_errors": layout_shifts, "diagnostics": column_diagnostics}), 200
     except Exception as e:
         return jsonify({"error": f"Internal MasterX workflow crash: {str(e)}"}), 500
