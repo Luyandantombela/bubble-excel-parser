@@ -27,8 +27,7 @@ def analyze_exclusive_type(series_str):
             clean_val = val.strip()
             if not re.match(valid_email_regex, clean_val):
                 has_invalid = "yes"
-                if clean_val != "":
-                    invalid_list.append(clean_val)
+                if clean_val != "": invalid_list.append(clean_val)
             if any(c.isupper() for c in clean_val): has_mixed_case = "yes"
         return "email", {
             "invalid_emails": has_invalid, 
@@ -98,12 +97,17 @@ def parse_excel():
         headers, total_rows, column_diagnostics, layout_shifts = list(df.columns), len(df), {}, []
         global_typos = run_table_similarity_scan(df)
 
+        # 🛠️ GLOBAL DUPLICATE ROW SCANNER (Identifies exact string match duplicates)
+        # Finds row positions that are identical copies (ignoring the first instance)
+        duplicate_mask = df.duplicated(keep='first')
+        # Map 0-based technical dataframe indexes directly into human 1-based spreadsheet rows
+        duplicate_indices = [int(idx + 1) for idx, is_dup in enumerate(duplicate_mask) if is_dup]
+
         for i, col in enumerate(headers):
             series = df[col]
             col_str = series.dropna().astype(str).str.strip()
             filled_count = len(col_str)
             if total_rows > 5 and filled_count > 0 and (filled_count / total_rows) < 0.15:
-                # 🛠️ FIXED: Added [0] so it extracts the actual text string instead of a raw indexer object
                 layout_shifts.append({"column": col, "error_msg": f"Stray text boundary shift in {col}.", "sample_value": col_str.iloc[0] if len(col_str) > 0 else ""})
             blank_count = int(series.isna().sum() + (series.astype(str).str.strip() == "").sum())
             detected_type, type_metrics = analyze_exclusive_type(col_str)
@@ -134,7 +138,15 @@ def parse_excel():
 
         df_cleaned = df.fillna("")
         clean_rows = ["|".join([str(val) for val in row]) for _, row in df_cleaned.iterrows()]
-        return jsonify({"headers": headers, "rows_json": clean_rows, "layout_alignment_errors": layout_shifts, "diagnostics": column_diagnostics}), 200
+        
+        # 📦 Returns the duplicate rows inside your primary payload packet
+        return jsonify({
+            "headers": headers, 
+            "rows_json": clean_rows, 
+            "layout_alignment_errors": layout_shifts, 
+            "duplicate_row_indices": duplicate_indices,
+            "diagnostics": column_diagnostics
+        }), 200
     except Exception as e:
         return jsonify({"error": f"Internal MasterX workflow crash: {str(e)}"}), 500
 
