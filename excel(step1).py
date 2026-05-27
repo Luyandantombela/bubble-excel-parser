@@ -21,12 +21,22 @@ def analyze_exclusive_type(series_str):
     email_density = series_str.str.contains('@', regex=False).sum()
     if (email_density / max(1, filled_count)) > 0.4:
         has_invalid, has_mixed_case = "no", "no"
+        invalid_list = []
         valid_email_regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,4}$'
         for val in series_str:
             clean_val = val.strip()
-            if not re.match(valid_email_regex, clean_val): has_invalid = "yes"
+            if not re.match(valid_email_regex, clean_val):
+                has_invalid = "yes"
+                if clean_val != "":
+                    invalid_list.append(clean_val)
             if any(c.isupper() for c in clean_val): has_mixed_case = "yes"
-        return "email", {"invalid_emails": has_invalid, "invalid_emails_desc": "Column contains broken email formats (e.g. missing a domain standard extension)." if has_invalid == "yes" else "Email formats are valid.", "mixed_case_emails": has_mixed_case, "mixed_case_emails_desc": "Emails contain mixed uppercase letters. These should be lowercase." if has_mixed_case == "yes" else "Email casing is uniform."}
+        return "email", {
+            "invalid_emails": has_invalid, 
+            "invalid_emails_desc": "Column contains broken email formats (e.g. missing a domain standard extension)." if has_invalid == "yes" else "Email formats are valid.", 
+            "invalid_email_list": list(set(invalid_list)),
+            "mixed_case_emails": has_mixed_case, 
+            "mixed_case_emails_desc": "Emails contain mixed uppercase letters. These should be lowercase." if has_mixed_case == "yes" else "Email casing is uniform."
+        }
 
     cleaned_digits = series_str.apply(lambda x: re.sub(r'[\s\-\(\)\+]', '', x))
     phone_matches = cleaned_digits.apply(lambda x: x.isdigit() and (7 <= len(x) <= 15)).sum()
@@ -93,7 +103,7 @@ def parse_excel():
             col_str = series.dropna().astype(str).str.strip()
             filled_count = len(col_str)
             if total_rows > 5 and filled_count > 0 and (filled_count / total_rows) < 0.15:
-                layout_shifts.append({"column": col, "error_msg": f"Stray text boundary shift in {col}.", "sample_value": col_str.iloc[0] if len(col_str) > 0 else ""})
+                layout_shifts.append({"column": col, "error_msg": f"Stray text boundary shift in {col}.", "sample_value": col_str.iloc if len(col_str) > 0 else ""})
             blank_count = int(series.isna().sum() + (series.astype(str).str.strip() == "").sum())
             detected_type, type_metrics = analyze_exclusive_type(col_str)
             mistakes_found = {"blank_cells": blank_count, "blank_cells_desc": f"Found {blank_count} empty rows missing values." if blank_count > 0 else "No missing values."}
@@ -104,7 +114,7 @@ def parse_excel():
                 mistakes_found["inconsistent_decimal_places"] = type_metrics.get("inconsistent_decimal_places", "no")
                 mistakes_found["inconsistent_decimal_places_desc"] = type_metrics.get("decimal_desc", "")
             elif detected_type == "date":
-                mistakes_found["inconsistent_dates_formatting"] = type_metrics.get("inconsistent_date_formatting", "no")
+                mistakes_found["inconsistent_dates_formatting"] = type_metrics.get("inconsistent_dates_formatting", "no")
                 mistakes_found["inconsistent_dates_formatting_desc"] = type_metrics.get("desc", "")
             elif detected_type == "phone":
                 mistakes_found["missing_leading_zeros"] = type_metrics.get("missing_leading_zeros", "no")
@@ -112,20 +122,17 @@ def parse_excel():
             elif detected_type == "email":
                 mistakes_found["invalid_emails"] = type_metrics.get("invalid_emails", "no")
                 mistakes_found["invalid_emails_desc"] = type_metrics.get("invalid_emails_desc", "")
+                mistakes_found["invalid_email_list"] = type_metrics.get("invalid_email_list", [])
                 mistakes_found["mixed_case_emails"] = type_metrics.get("mixed_case_emails", "no")
                 mistakes_found["mixed_case_emails_desc"] = type_metrics.get("mixed_case_emails_desc", "")
             elif detected_type == "text":
                 mistakes_found["inconsistent_formatting"] = type_metrics.get("inconsistent_formatting", "no")
                 mistakes_found["inconsistent_formatting_desc"] = type_metrics.get("casing_desc", "")
-                
-                # 🛠️ HERE WE GO: Collects only the specific words flagged inside this specific text column
-                col_typos = [w for w in global_typos if w in col_str.values]
-                mistakes_found["misspellings"] = col_typos
-
+                mistakes_found["misspellings"] = [w for w in global_typos if w in col_str.values]
             column_diagnostics[col] = {"class": detected_type, "mistakes_found": mistakes_found}
 
         df_cleaned = df.fillna("")
-        clean_rows = ["|".join([str(val) for val in row]) for _, row in df_cleaned.iterrows()]
+        clean_rows = ["| ".join([str(val) for val in row]) for _, row in df_cleaned.iterrows()]
         return jsonify({"headers": headers, "rows_json": clean_rows, "layout_alignment_errors": layout_shifts, "diagnostics": column_diagnostics}), 200
     except Exception as e:
         return jsonify({"error": f"Internal MasterX workflow crash: {str(e)}"}), 500
