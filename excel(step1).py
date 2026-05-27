@@ -64,26 +64,24 @@ def analyze_exclusive_type(series_str):
     else: inconsistent_casing = "yes"
     return "text", {"inconsistent_formatting": inconsistent_casing, "casing_desc": "Hidden newline breaks (\\n) found breaking cell format limits." if has_newlines == "yes" else "Inconsistent text casing layouts found."}
 
-def run_table_similarity_scan(df):
+def find_column_typos(series_str):
     word_pool = []
-    for col in df.columns:
-        cleaned_col_name = re.sub(r'[^a-zA-Z\s]', '', str(col))
-        for token in cleaned_col_name.split():
-            if len(token) > 3: word_pool.append(token.lower().strip())
-        for val in df[col].dropna().astype(str).str.strip().unique():
-            clean_str = re.sub(r'[^a-zA-Z\s]', '', val)
-            for token in clean_str.split():
-                if len(token) > 3: word_pool.append(token.lower().strip())
-    unique_words = list(set(word_pool))
-    typos = []
+    for val in series_str.dropna().astype(str).str.strip():
+        clean_text = re.sub(r'[^a-zA-Z\s]', '', val)
+        for chunk in clean_text.split():
+            if len(chunk) > 3: word_pool.append(chunk.lower())
+    if not word_pool: return []
+    freq_map = pd.Series(word_pool).value_counts().to_dict()
+    unique_words = list(freq_map.keys())
+    flagged_anomalies = []
     for idx, word in enumerate(unique_words):
         for candidate in unique_words[idx+1:]:
             if abs(len(word) - len(candidate)) <= 2:
                 if word[:-1] == candidate or candidate[:-1] == word or (word[:-2] == candidate[:-2] and word[:3] == candidate[:3]):
                     if not (word.startswith("unite") or candidate.startswith("unite")):
-                        typos.append(word)
-                        typos.append(candidate)
-    return list(set(typos))
+                        rare_word = word if freq_map[word] < freq_map[candidate] else candidate
+                        flagged_anomalies.append(rare_word)
+    return list(set(flagged_anomalies))
 
 @app.route("/parse-excel", methods=["POST"])
 def parse_excel():
@@ -94,8 +92,7 @@ def parse_excel():
         df = pd.read_csv(io.BytesIO(file.read()), dtype=str) if file.filename.endswith('.csv') else pd.read_excel(io.BytesIO(file.read()), dtype=str)
         df.columns = [str(col).strip() if not str(col).startswith("Unnamed:") else f"Column {i+1}" for i, col in enumerate(df.columns)]
         headers, total_rows, column_diagnostics, layout_shifts = list(df.columns), len(df), {}, []
-        global_typos = run_table_similarity_scan(df)
-
+        
         duplicate_mask = df.duplicated(keep='first')
         duplicate_indices = [int(idx + 1) for idx, is_dup in enumerate(duplicate_mask) if is_dup]
 
@@ -129,10 +126,7 @@ def parse_excel():
             elif detected_type == "text":
                 mistakes_found["inconsistent_formatting"] = type_metrics.get("inconsistent_formatting", "no")
                 mistakes_found["inconsistent_formatting_desc"] = type_metrics.get("casing_desc", "")
-                col_typos = []
-                for word in global_typos:
-                    if col_str.str.lower().str.contains(word, regex=False).any(): col_typos.append(word)
-                mistakes_found["misspellings"] = list(set(col_typos))
+                mistakes_found["misspellings"] = find_column_typos(col_str)
 
             column_diagnostics[col] = {"class": detected_type, "mistakes_found": mistakes_found}
 
