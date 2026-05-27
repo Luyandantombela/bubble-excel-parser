@@ -29,13 +29,7 @@ def analyze_exclusive_type(series_str):
                 has_invalid = "yes"
                 if clean_val != "": invalid_list.append(clean_val)
             if any(c.isupper() for c in clean_val): has_mixed_case = "yes"
-        return "email", {
-            "invalid_emails": has_invalid, 
-            "invalid_emails_desc": "Column contains broken email formats (e.g. missing a domain standard extension)." if has_invalid == "yes" else "Email formats are valid.", 
-            "invalid_email_list": list(set(invalid_list)),
-            "mixed_case_emails": has_mixed_case, 
-            "mixed_case_emails_desc": "Emails contain mixed uppercase letters. These should be lowercase." if has_mixed_case == "yes" else "Email casing is uniform."
-        }
+        return "email", {"invalid_emails": has_invalid, "invalid_emails_desc": "Column contains broken email formats (e.g. missing a domain extension)." if has_invalid == "yes" else "Email formats are valid.", "invalid_email_list": list(set(invalid_list)), "mixed_case_emails": has_mixed_case, "mixed_case_emails_desc": "Emails contain mixed uppercase letters. These should be lowercase." if has_mixed_case == "yes" else "Email casing is uniform."}
 
     cleaned_digits = series_str.apply(lambda x: re.sub(r'[\s\-\(\)\+]', '', x))
     phone_matches = cleaned_digits.apply(lambda x: x.isdigit() and (7 <= len(x) <= 15)).sum()
@@ -71,20 +65,25 @@ def analyze_exclusive_type(series_str):
     return "text", {"inconsistent_formatting": inconsistent_casing, "casing_desc": "Hidden newline breaks (\\n) found breaking cell format limits." if has_newlines == "yes" else "Inconsistent text casing layouts found."}
 
 def run_table_similarity_scan(df):
-    text_pool = []
+    word_pool = []
     for col in df.columns:
+        cleaned_col_name = re.sub(r'[^a-zA-Z\s]', '', str(col))
+        for token in cleaned_col_name.split():
+            if len(token) > 3: word_pool.append(token.lower().strip())
         for val in df[col].dropna().astype(str).str.strip().unique():
-            if not re.search(r'\d', val) and len(val) > 4 and " " not in val: text_pool.append(val)
-    unique_tokens = list(set(text_pool))
+            clean_str = re.sub(r'[^a-zA-Z\s]', '', val)
+            for token in clean_str.split():
+                if len(token) > 3: word_pool.append(token.lower().strip())
+    unique_words = list(set(word_pool))
     typos = []
-    for idx, word in enumerate(unique_tokens):
-        for candidate in unique_tokens[idx+1:]:
+    for idx, word in enumerate(unique_words):
+        for candidate in unique_words[idx+1:]:
             if abs(len(word) - len(candidate)) <= 2:
-                if word[:-1] == candidate or candidate[:-1] == word or (word[:-2] == candidate[:-2] and word.lower()[:3] == candidate.lower()[:3]):
-                    if not (word.lower().startswith("unite") and candidate.lower().startswith("unite")):
+                if word[:-1] == candidate or candidate[:-1] == word or (word[:-2] == candidate[:-2] and word[:3] == candidate[:3]):
+                    if not (word.startswith("unite") or candidate.startswith("unite")):
                         typos.append(word)
-                        if len(typos) >= 8: return typos
-    return typos
+                        typos.append(candidate)
+    return list(set(typos))
 
 @app.route("/parse-excel", methods=["POST"])
 def parse_excel():
@@ -97,10 +96,7 @@ def parse_excel():
         headers, total_rows, column_diagnostics, layout_shifts = list(df.columns), len(df), {}, []
         global_typos = run_table_similarity_scan(df)
 
-        # 🛠️ GLOBAL DUPLICATE ROW SCANNER (Identifies exact string match duplicates)
-        # Finds row positions that are identical copies (ignoring the first instance)
         duplicate_mask = df.duplicated(keep='first')
-        # Map 0-based technical dataframe indexes directly into human 1-based spreadsheet rows
         duplicate_indices = [int(idx + 1) for idx, is_dup in enumerate(duplicate_mask) if is_dup]
 
         for i, col in enumerate(headers):
@@ -119,7 +115,7 @@ def parse_excel():
                 mistakes_found["inconsistent_decimal_places"] = type_metrics.get("inconsistent_decimal_places", "no")
                 mistakes_found["inconsistent_decimal_places_desc"] = type_metrics.get("decimal_desc", "")
             elif detected_type == "date":
-                mistakes_found["inconsistent_dates_formatting"] = type_metrics.get("inconsistent_date_formatting", "no")
+                mistakes_found["inconsistent_dates_formatting"] = type_metrics.get("inconsistent_dates_formatting", "no")
                 mistakes_found["inconsistent_dates_formatting_desc"] = type_metrics.get("desc", "")
             elif detected_type == "phone":
                 mistakes_found["missing_leading_zeros"] = type_metrics.get("missing_leading_zeros", "no")
@@ -133,20 +129,16 @@ def parse_excel():
             elif detected_type == "text":
                 mistakes_found["inconsistent_formatting"] = type_metrics.get("inconsistent_formatting", "no")
                 mistakes_found["inconsistent_formatting_desc"] = type_metrics.get("casing_desc", "")
-                mistakes_found["misspellings"] = [w for w in global_typos if w in col_str.values]
+                col_typos = []
+                for word in global_typos:
+                    if col_str.str.lower().str.contains(word, regex=False).any(): col_typos.append(word)
+                mistakes_found["misspellings"] = list(set(col_typos))
+
             column_diagnostics[col] = {"class": detected_type, "mistakes_found": mistakes_found}
 
         df_cleaned = df.fillna("")
         clean_rows = ["|".join([str(val) for val in row]) for _, row in df_cleaned.iterrows()]
-        
-        # 📦 Returns the duplicate rows inside your primary payload packet
-        return jsonify({
-            "headers": headers, 
-            "rows_json": clean_rows, 
-            "layout_alignment_errors": layout_shifts, 
-            "duplicate_row_indices": duplicate_indices,
-            "diagnostics": column_diagnostics
-        }), 200
+        return jsonify({"headers": headers, "rows_json": clean_rows, "layout_alignment_errors": layout_shifts, "duplicate_row_indices": duplicate_indices, "diagnostics": column_diagnostics}), 200
     except Exception as e:
         return jsonify({"error": f"Internal MasterX workflow crash: {str(e)}"}), 500
 
