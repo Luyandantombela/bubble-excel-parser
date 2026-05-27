@@ -9,15 +9,6 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-# Helper function to detect number column types
-def is_numeric_column(series):
-    # Try converting non-null values to numeric to see if it's a number column
-    dropped = series.dropna()
-    if len(dropped) == 0:
-        return False
-    converted = pd.to_numeric(dropped.astype(str).str.replace(r'[R\$\s,]', '', regex=True), errors='coerce')
-    return converted.notna().sum() / len(dropped) > 0.5
-
 @app.route("/parse-excel", methods=["POST"])
 def parse_excel():
     try:
@@ -37,83 +28,100 @@ def parse_excel():
             file_stream.seek(0)
             df = pd.read_excel(file_stream, engine="openpyxl")
 
-        # Clean and standardise column headers
+        # Standardise headers cleanly
         df.columns = [
             str(col).strip() if not str(col).startswith("Unnamed:") else f"Column {i+1}"
             for i, col in enumerate(df.columns)
         ]
         headers = list(df.columns)
+        total_rows = len(df)
 
         # -------------------------------------------------------------------
-        # 🧠 THE DIAGNOSTIC DISCOVERY ENGINE (Scans mistakes & makes choices)
+        # 🧠 THE BLIND DATA DIAGNOSTIC ENGINE (Analyzes cells, ignores names)
         # -------------------------------------------------------------------
         column_diagnostics = {}
+        layout_shifts = []
 
-        for col in headers:
+        for i, col in enumerate(headers):
             series = df[col]
-            total_rows = len(series)
-            
-            # 1. EMPTY CELLS SCANNER
+            col_str = series.dropna().astype(str).str.strip()
+            filled_rows_count = len(col_str)
+
+            # --- BUG FIX 3: GLOBAL LAYOUT SHIFT DETECTOR ---
+            # If a column is almost entirely empty but contains a rare rogue entry out on the edge
+            if filled_rows_count > 0 and (filled_rows_count / max(1, total_rows)) < 0.15:
+                # If it's one of the last columns, flag it as a layout alignment error
+                if i >= (len(headers) - 2):
+                    layout_shifts.append({
+                        "column": col,
+                        "error_msg": f"Stray text detected in {col}. Data may have shifted out of bounds.",
+                        "sample_value": col_str.iloc[0] if len(col_str) > 0 else ""
+                    })
+
+            # 1. EMPTY CELLS SCANNER (Applies to all columns universaly)
             blank_count = series.isna().sum() + (series.astype(str).str.strip() == "").sum()
             has_blanks = int(blank_count > 0)
-            # Professional Default Choice: 0 for numbers, "Unknown" for text strings
-            is_num = is_numeric_column(series)
+
+            # --- BLIND DATA CLASSIFICATION SYSTEM ---
+            # Look at characters inside the cells to figure out the column type natively
+            digits_only = col_str.str.replace(r'\D', '', regex=True)
+            has_digits_count = (digits_only.str.len() > 0).sum()
+            
+            # Check for math symbols or digits to classify Numeric Columns
+            numeric_like_count = col_str.str.contains(r'[\d\-\.\$\(R]', regex=True).sum()
+            
+            is_num = int((numeric_like_count / max(1, filled_rows_count)) > 0.4 and not col_str.str.contains(r'[@]', regex=True).any())
+            
+            # --- BUG FIX 2: SENSITIVE PHONE DETECTOR ---
+            # Checks if cells hold strings containing between 3 and 15 digits (handles short codes & long text noise)
+            is_phone = int(digits_only.str.len().isin(range(3, 16)).sum() > 0.15 * max(1, filled_rows_count) and not is_num and "@" not in "".join(col_str))
+
+            # Check for date patterns matching common dash/slash configurations
+            is_date = int(col_str.str.contains(r'(\d{4}[-/]\d{2}[-/]\d{2})|(\d{2}[-/]\d{2}[-/]\d{4})|(\d{2}[-/]\d{2}[-/]\d{2})', regex=True).sum() > 0.15 * max(1, filled_rows_count))
+            
+            is_text = int(not is_num and not is_date and not is_phone)
+
+            # Smart Default Filler Input Value Choice Assignment
             default_fill = "0" if is_num else "Unknown"
 
             # 2. DATE CONFORMANCE SCANNER
-            has_dates = 0
             date_mismatch = 0
-            col_str = series.dropna().astype(str).str.strip()
-            # Basic regex to spot common forward slash or dash date patterns
-            date_patterns = col_str.str.contains(r'(\d{4}[-/]\d{2}[-/]\d{2})|(\d{2}[-/]\d{2}[-/]\d{4})|(\d{2}[-/]\d{2}[-/]\d{2})', regex=True)
-            if date_patterns.sum() > 0.2 * total_rows: # If over 20% looks like dates, treat as date column
-                has_dates = 1
-                # Try parsing to see how many fail standard ISO structure natively
+            if is_date:
                 parsed_dates = pd.to_datetime(col_str, errors='coerce')
                 date_mismatch = int(parsed_dates.isna().sum() > 0)
 
-            # 3. PHONE NUMBER INTEGRITY SCANNER
-            has_phones = 0
+            # Phone missing zeros check
             phone_missing_zero = 0
-            # Strip spaces/symbols to check digit length distributions
-            digits_only = col_str.str.replace(r'\D', '', regex=True)
-            valid_len_check = digits_only.str.len().isin([9, 10])
-            if valid_len_check.sum() > 0.3 * total_rows: # Treat as a contact phone number column
-                has_phones = 1
-                # Spot numbers starting with 7, 8, 6 or missing standard country/area leading tags
-                missing_zero_pattern = digits_only.str.len() == 9
-                phone_missing_zero = int(missing_zero_pattern.sum() > 0)
+            if is_phone:
+                # If it's a 9 digit string or starts with standard mobile digits without a 0
+                phone_missing_zero = int((digits_only.str.len() == 9).sum() > 0 or (digits_only.str.startswith(('7', '8', '6'))).sum() > 0)
 
-            # 4. TEXT CASE SETTINGS SCANNER
+            # 4. TEXT FORMATTING SCANNER
             has_text_chaos = 0
-            default_case_choice = "title" # Default: Capitalise Each First Letter
-            if not is_num and not has_dates and not has_phones:
-                # Check for inconsistent formatting variations inside text
-                has_mixed_case = int(series.dropna().astype(str).str.isupper().sum() > 0 and series.dropna().astype(str).str.islower().sum() > 0)
-                has_spaces = int((series.dropna().astype(str).str.startswith(" ") | series.dropna().astype(str).str.endswith(" ")).sum() > 0)
+            default_case_choice = "title"
+            if is_text:
+                has_mixed_case = int(col_str.str.isupper().sum() > 0 and col_str.str.islower().sum() > 0)
+                has_spaces = int((col_str.str.startswith(" ") | col_str.str.endswith(" ")).sum() > 0)
                 if has_mixed_case or has_spaces:
                     has_text_chaos = 1
-                
-                # Smart choice selector: If the column text looks like an upper-case code block, preserve it
-                if series.dropna().astype(str).str.isupper().sum() / max(1, len(series.dropna())) > 0.6:
+                if (col_str.str.isupper().sum() / max(1, filled_rows_count)) > 0.5:
                     default_case_choice = "upper"
 
-            # 5. NUMBER CURRENCY & ROUNDING SCANNER
+            # --- BUG FIX 1: UNIVERSAL COERCED NUMBER SCANNER ---
+            # Strips typical characters dynamically to catch currency prefixes and decimal spacing
             has_number_chaos = 0
             has_decimals = 0
-            if is_num and not has_dates:
-                # Check for text symbols mixed into currency like 'R' or '$'
-                has_currency_symbols = int(series.dropna().astype(str).str.contains(r'[R\$a-zA-Z]', regex=True).sum() > 0)
-                # Check if there are long uneven decimal strings that require rounding
+            if is_num:
+                has_currency_symbols = int(col_str.str.contains(r'[R\$a-zA-Z]', regex=True).sum() > 0)
                 try:
-                    numeric_floats = pd.to_numeric(df[col].astype(str).str.replace(r'[R\$\s,]', '', regex=True), errors='coerce').dropna()
+                    numeric_floats = pd.to_numeric(col_str.str.replace(r'[R\$\s,]', '', regex=True), errors='coerce').dropna()
                     has_decimals = int((numeric_floats % 1 != 0).sum() > 0)
                 except: pass
                 
-                if has_currency_symbols or has_decimals:
+                if has_currency_symbols or has_decimals or (series < 0).any():
                     has_number_chaos = 1
 
-            # Store the full column diagnosis report back for Bubble
+            # Compile the specific blind profile diagnostics dictionary entry
             column_diagnostics[col] = {
                 "empty_cells": {
                     "found": int(has_blanks),
@@ -121,17 +129,17 @@ def parse_excel():
                     "default_value": default_fill
                 },
                 "dates": {
-                    "is_date_column": int(has_dates),
+                    "is_date_column": int(is_date),
                     "has_mixed_formats": int(date_mismatch),
                     "default_format": "YYYY-MM-DD"
                 },
                 "phones": {
-                    "is_phone_column": int(has_phones),
+                    "is_phone_column": int(is_phone),
                     "has_missing_zeros": int(phone_missing_zero),
                     "default_mode": "single"
                 },
                 "text": {
-                    "is_text_column": int(not is_num and not has_dates and not has_phones),
+                    "is_text_column": int(is_text),
                     "has_formatting_issues": int(has_text_chaos),
                     "default_case": default_case_choice
                 },
@@ -142,25 +150,22 @@ def parse_excel():
                 }
             }
 
-        # -------------------------------------------------------------------
-        # 📦 PACKAGING THE CELL STRINGS GRID (Your original pipe serializer)
-        # -------------------------------------------------------------------
+        # Packaging cell data payload
         df_cleaned = df.fillna("")
         clean_rows = []
         for _, row in df_cleaned.iterrows():
             row_string = "|".join([str(val) for val in row])
             clean_rows.append(row_string)
 
-        # Send everything back inside a structured JSON response bundle
         return jsonify({
             "headers": headers, 
             "rows_json": clean_rows,
-            "diagnostics": column_diagnostics
+            "diagnostics": column_diagnostics,
+            "layout_alignment_errors": layout_shifts
         }), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
