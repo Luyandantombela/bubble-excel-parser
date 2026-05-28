@@ -433,10 +433,40 @@ def parse_excel():
 
 
 # ── Extraction helpers ────────────────────────────────────────────────────────
+def _is_garbled(text: str) -> bool:
+    """Detect garbled PDF text - mixed case chaos from overlapping text streams."""
+    if not text or len(text) < 6:
+        return False
+    for word in text.split():
+        if len(word) >= 6:
+            upper = sum(1 for c in word if c.isupper())
+            lower = sum(1 for c in word if c.islower())
+            if upper >= 2 and lower >= 2:
+                transitions = sum(
+                    1 for i in range(len(word)-1)
+                    if word[i].isupper() != word[i+1].isupper()
+                )
+                if transitions >= 4:
+                    return True
+    return False
+
+
+def _ocr_row_text(page, y0: float, y1: float) -> str:
+    """OCR a single row band from a PDF page."""
+    if not OCR_AVAILABLE:
+        return ""
+    try:
+        cropped = page.crop((0, y0 - 2, page.width, y1 + 2))
+        img = cropped.to_image(resolution=250).original
+        return pytesseract.image_to_string(img, config="--psm 7").strip()
+    except Exception:
+        return ""
+
+
 def extract_pdf_as_dataframe(raw: bytes) -> pd.DataFrame:
     """
-    Try to extract a structured table from PDF first.
-    Falls back to plain text extraction if no table found.
+    Extract a structured table from PDF using pdfplumber.
+    Detects garbled text encoding and falls back to OCR per-row when needed.
     """
     if not PDF_AVAILABLE:
         raise RuntimeError("pdfplumber is not installed.")
@@ -447,28 +477,58 @@ def extract_pdf_as_dataframe(raw: bytes) -> pd.DataFrame:
     with pdfplumber.open(io.BytesIO(raw)) as pdf:
         for page in pdf.pages:
             table = page.extract_table()
-            if table:
-                for row in table:
-                    clean = [str(c).strip() if c else '' for c in row]
-                    # Skip fully blank rows
-                    if all(c == '' for c in clean):
-                        continue
-                    # Skip title/header rows where only 1 cell has content
-                    if sum(1 for c in clean if c) == 1:
-                        continue
-                    # Use first row that looks like real headers
-                    if headers is None and sum(1 for c in clean if c) >= 3:
-                        headers = clean
-                    else:
-                        all_rows.append(clean)
+            if not table:
+                continue
+
+            # Build a word->y lookup for OCR fallback
+            words_by_text = {}
+            for w in page.extract_words():
+                words_by_text.setdefault(w["text"][:8], w)
+
+            for row in table:
+                clean = [str(c).strip() if c else "" for c in row]
+
+                if all(c == "" for c in clean):
+                    continue
+                if sum(1 for c in clean if c) == 1:
+                    continue
+
+                if headers is None and sum(1 for c in clean if c) >= 3:
+                    headers = clean
+                    continue
+
+                # Check for garbled cells
+                row_text = " ".join(c for c in clean if c)
+                if _is_garbled(row_text) and OCR_AVAILABLE:
+                    # Find y position via a clean cell value
+                    known = next((c for c in clean if c and not _is_garbled(c) and len(c) > 4), None)
+                    if known:
+                        match = words_by_text.get(known[:8])
+                        if match:
+                            ocr_line = _ocr_row_text(page, match["top"], match["bottom"])
+                            if ocr_line:
+                                # Replace garbled cells with OCR text in the description cell
+                                fixed = []
+                                replaced = False
+                                for c in clean:
+                                    if _is_garbled(c) and not replaced:
+                                        fixed.append(ocr_line[:80])
+                                        replaced = True
+                                    elif _is_garbled(c):
+                                        fixed.append("")
+                                    else:
+                                        fixed.append(c)
+                                all_rows.append(fixed)
+                                continue
+
+                all_rows.append(clean)
 
     if all_rows:
-        # Pad rows to match header length
         col_count = len(headers) if headers else max(len(r) for r in all_rows)
-        padded = [r + [''] * (col_count - len(r)) for r in all_rows]
+        padded = [r + [""] * (col_count - len(r)) for r in all_rows]
         return pd.DataFrame(padded, columns=headers if headers else [f"Column {i+1}" for i in range(col_count)])
 
-    # Fallback: plain text extraction
+    # Fallback: plain text
     text_parts = []
     with pdfplumber.open(io.BytesIO(raw)) as pdf:
         for page in pdf.pages:
