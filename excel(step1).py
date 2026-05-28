@@ -433,16 +433,49 @@ def parse_excel():
 
 
 # ── Extraction helpers ────────────────────────────────────────────────────────
-def extract_text_from_pdf(raw: bytes) -> str:
+def extract_pdf_as_dataframe(raw: bytes) -> pd.DataFrame:
+    """
+    Try to extract a structured table from PDF first.
+    Falls back to plain text extraction if no table found.
+    """
     if not PDF_AVAILABLE:
         raise RuntimeError("pdfplumber is not installed.")
-    parts = []
+
+    all_rows = []
+    headers = None
+
+    with pdfplumber.open(io.BytesIO(raw)) as pdf:
+        for page in pdf.pages:
+            table = page.extract_table()
+            if table:
+                for row in table:
+                    clean = [str(c).strip() if c else '' for c in row]
+                    # Skip fully blank rows
+                    if all(c == '' for c in clean):
+                        continue
+                    # Skip title/header rows where only 1 cell has content
+                    if sum(1 for c in clean if c) == 1:
+                        continue
+                    # Use first row that looks like real headers
+                    if headers is None and sum(1 for c in clean if c) >= 3:
+                        headers = clean
+                    else:
+                        all_rows.append(clean)
+
+    if all_rows:
+        # Pad rows to match header length
+        col_count = len(headers) if headers else max(len(r) for r in all_rows)
+        padded = [r + [''] * (col_count - len(r)) for r in all_rows]
+        return pd.DataFrame(padded, columns=headers if headers else [f"Column {i+1}" for i in range(col_count)])
+
+    # Fallback: plain text extraction
+    text_parts = []
     with pdfplumber.open(io.BytesIO(raw)) as pdf:
         for page in pdf.pages:
             t = page.extract_text()
             if t:
-                parts.append(t)
-    return "\n".join(parts)
+                text_parts.append(t)
+    return parse_text_to_dataframe("\n".join(text_parts))
 
 
 def extract_text_from_docx(raw: bytes) -> str:
@@ -583,7 +616,7 @@ def extract_to_excel():
         raw   = file.read()
 
         if fname.endswith('.pdf'):
-            df = parse_text_to_dataframe(extract_text_from_pdf(raw))
+            df = extract_pdf_as_dataframe(raw)
         elif fname.endswith('.docx'):
             df = parse_text_to_dataframe(extract_text_from_docx(raw))
         elif fname.endswith('.doc'):
