@@ -6,3 +6,8 @@ openpyxl==3.1.5
 numpy==2.4.6
 pyspellchecker
 odfpy
+pdfplumber
+python-docx
+python-pptx
+Pillow
+pytesseract
