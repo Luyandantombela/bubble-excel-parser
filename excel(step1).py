@@ -523,10 +523,24 @@ def extract_pdf_as_dataframe(raw: bytes) -> pd.DataFrame:
 
                 all_rows.append(clean)
 
+    warning = ""
     if all_rows:
         col_count = len(headers) if headers else max(len(r) for r in all_rows)
         padded = [r + [""] * (col_count - len(r)) for r in all_rows]
-        return pd.DataFrame(padded, columns=headers if headers else [f"Column {i+1}" for i in range(col_count)])
+        df = pd.DataFrame(padded, columns=headers if headers else [f"Column {i+1}" for i in range(col_count)])
+        # Count garbled cells across the whole dataframe
+        garbled_count = sum(
+            1 for col in df.columns
+            for val in df[col].astype(str)
+            if _is_garbled(val)
+        )
+        if garbled_count > 0:
+            warning = (
+                f"This PDF has a corrupted text layer affecting {garbled_count} cell(s). "
+                "The file has been exported with the best available extraction. "
+                "For perfect results, please use the original Word or Excel source file."
+            )
+        return df, warning
 
     # Fallback: plain text
     text_parts = []
@@ -535,7 +549,7 @@ def extract_pdf_as_dataframe(raw: bytes) -> pd.DataFrame:
             t = page.extract_text()
             if t:
                 text_parts.append(t)
-    return parse_text_to_dataframe("\n".join(text_parts))
+    return parse_text_to_dataframe("\n".join(text_parts)), warning
 
 
 def extract_text_from_docx(raw: bytes) -> str:
@@ -641,7 +655,7 @@ def parse_text_to_dataframe(text: str) -> pd.DataFrame:
     return pd.DataFrame({"Content": lines})
 
 
-def build_excel_base64(df: pd.DataFrame, filename: str) -> dict:
+def build_excel_base64(df: pd.DataFrame, filename: str, warning: str = "") -> dict:
     """Write df to xlsx in memory, return base64 JSON payload."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -655,11 +669,13 @@ def build_excel_base64(df: pd.DataFrame, filename: str) -> dict:
             ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 4, 60)
     output.seek(0)
     encoded = base64.b64encode(output.read()).decode('utf-8')
-    return {
+    payload = {
         "filename": filename,
         "mimetype": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "file_base64": encoded
+        "file_base64": encoded,
+        "warning": warning
     }
+    return payload
 
 
 # ── /extract-to-excel ─────────────────────────────────────────────────────────
@@ -675,8 +691,9 @@ def extract_to_excel():
         fname = file.filename.lower()
         raw   = file.read()
 
+        warning = ""
         if fname.endswith('.pdf'):
-            df = extract_pdf_as_dataframe(raw)
+            df, warning = extract_pdf_as_dataframe(raw)
         elif fname.endswith('.docx'):
             df = parse_text_to_dataframe(extract_text_from_docx(raw))
         elif fname.endswith('.doc'):
@@ -713,7 +730,7 @@ def extract_to_excel():
         safe_name     = re.sub(r'[^\w\-]', '_', base_name)
         download_name = f"{safe_name}_extracted.xlsx"
 
-        return jsonify(build_excel_base64(df, download_name)), 200
+        return jsonify(build_excel_base64(df, download_name, warning)), 200
 
     except RuntimeError as e:
         return jsonify({"error": f"Missing library: {str(e)}"}), 500
