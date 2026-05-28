@@ -677,19 +677,21 @@ def extract_to_excel():
                 adjusted_width = min(max_len + 4, 60)
                 worksheet.column_dimensions[col_letter].width = adjusted_width
 
-        output.seek(0)
+output.seek(0)
 
         # ── Build a clean output filename ──
-        base_name = re.sub(r'\.[^.]+$', '', file.filename)  # strip extension
+        base_name = re.sub(r'\.[^.]+$', '', file.filename)
         safe_name = re.sub(r'[^\w\-]', '_', base_name)
         download_name = f"{safe_name}_extracted.xlsx"
 
-        return send_file(
-            output,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            as_attachment=True,
-            download_name=download_name
-        )
+        # ── Return as base64 JSON so Bubble can handle it ──
+        import base64
+        encoded = base64.b64encode(output.read()).decode('utf-8')
+        return jsonify({
+            "filename": download_name,
+            "mimetype": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "file_base64": encoded
+        }), 200
 
     except RuntimeError as e:
         return jsonify({"error": f"Missing library: {str(e)}"}), 500
