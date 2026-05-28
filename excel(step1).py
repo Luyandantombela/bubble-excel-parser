@@ -1,11 +1,36 @@
 import io, json, os, re, datetime
 import pandas as pd
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
+
+# ── New imports for /extract-to-excel ──
+try:
+    import pdfplumber
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
+
+try:
+    from docx import Document as DocxDocument
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+
+try:
+    from pptx import Presentation
+    PPTX_AVAILABLE = True
+except ImportError:
+    PPTX_AVAILABLE = False
+
+try:
+    from PIL import Image
+    import pytesseract
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
 
 try:
     from spellchecker import SpellChecker
-    # ── Instantiate ONCE at module load, not per column ──
     _SPELL = SpellChecker()
     SPELLCHECK_AVAILABLE = True
 except ImportError:
@@ -21,16 +46,16 @@ CUSTOM_WHITELIST = {
 }
 
 # ── Pre-compile every regex used in hot loops ──
-_RE_NON_ALPHA   = re.compile(r'[^a-zA-Z\s]')
+_RE_NON_ALPHA     = re.compile(r'[^a-zA-Z\s]')
 _RE_NON_DIGIT_SEP = re.compile(r'[^\d\.\-]')
-_RE_DATE1       = re.compile(r'^\d{4}[-/]\d{2}[-/]\d{2}$')
-_RE_DATE2       = re.compile(r'^\d{2}[-/]\d{2}[-/]\d{2,4}$')
-_RE_DATE_MASK   = re.compile(r'\d')
-_RE_VALID_EMAIL = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,4}$')
-_RE_NON_DIGIT   = re.compile(r'[\s\-\(\)\+]')
-_RE_NUMBER_CLEAN= re.compile(r'[^\d\.,\-]')
-_RE_CONTAMINATE = re.compile(r'[A-Za-z\$£€R]')
-_RE_TITLE       = re.compile(r'^[A-Z][a-z]*(\s+[A-Z][a-z]*)*$')
+_RE_DATE1         = re.compile(r'^\d{4}[-/]\d{2}[-/]\d{2}$')
+_RE_DATE2         = re.compile(r'^\d{2}[-/]\d{2}[-/]\d{2,4}$')
+_RE_DATE_MASK     = re.compile(r'\d')
+_RE_VALID_EMAIL   = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,4}$')
+_RE_NON_DIGIT     = re.compile(r'[\s\-\(\)\+]')
+_RE_NUMBER_CLEAN  = re.compile(r'[^\d\.,\-]')
+_RE_CONTAMINATE   = re.compile(r'[A-Za-z\$£€R]')
+_RE_TITLE         = re.compile(r'^[A-Z][a-z]*(\s+[A-Z][a-z]*)*$')
 _RE_NON_ALPHA_KEY = re.compile(r'[^a-zA-Z]')
 
 _DATE_FORMATS = [
@@ -60,7 +85,6 @@ def find_column_typos(series_str):
                     found[word] = correction if correction and correction != word else None
         return [{"original": k, "suggestion": v} for k, v in found.items()]
 
-    # Fallback: frequency heuristic — limit to top-200 words to avoid O(n²) explosion
     word_pool = []
     for val in series_str:
         clean_text = _RE_NON_ALPHA.sub('', val)
@@ -71,7 +95,6 @@ def find_column_typos(series_str):
         return []
 
     freq_map = pd.Series(word_pool).value_counts()
-    # Only compare top 200 words — beyond that the O(n²) loop is too expensive
     unique_words = list(freq_map.head(200).index)
     flagged = set()
     for i, word in enumerate(unique_words):
@@ -86,18 +109,13 @@ def find_column_typos(series_str):
 
 
 # ─────────────────────────────────────────────
-# TYPE DETECTION  — operates on a plain Python list for speed
+# TYPE DETECTION
 # ─────────────────────────────────────────────
 def analyze_exclusive_type(values: list):
-    """
-    values: list of non-blank stripped strings (already filtered upstream).
-    Returns (type_str, metrics_dict).
-    """
     filled_count = len(values)
     if filled_count == 0:
         return "text", {}
 
-    # DATE
     date_matches = sum(
         1 for x in values
         if _RE_DATE1.match(x) or _RE_DATE2.match(x)
@@ -110,7 +128,6 @@ def analyze_exclusive_type(values: list):
             "desc": "Mixed date formats found." if has_mixed == "yes" else "Dates are uniform."
         }
 
-    # EMAIL
     at_count = sum(1 for x in values if '@' in x)
     if at_count / filled_count > 0.4:
         has_invalid, has_mixed_case = "no", "no"
@@ -133,7 +150,6 @@ def analyze_exclusive_type(values: list):
             )
         }
 
-    # PHONE
     phone_matches = sum(
         1 for x in values
         if (d := _RE_NON_DIGIT.sub('', x)).isdigit() and 7 <= len(d) <= 15
@@ -156,7 +172,6 @@ def analyze_exclusive_type(values: list):
                 break
         return "phone", {"missing_leading_zeros": has_issue, "desc": issue_desc}
 
-    # NUMBER
     number_score, has_contamination, decimal_lengths = 0, "no", []
     for val in values:
         cleaned = _RE_NUMBER_CLEAN.sub('', val.replace(',', '.'))
@@ -184,7 +199,6 @@ def analyze_exclusive_type(values: list):
             )
         }
 
-    # TEXT
     lower_count = upper_count = title_count = 0
     has_newlines = "no"
     for val in values:
@@ -213,14 +227,10 @@ def analyze_exclusive_type(values: list):
 
 
 # ─────────────────────────────────────────────
-# SUGGEST CLEAN VALUE  (vectorised per column, not per cell)
+# SUGGEST CLEAN VALUE
 # ─────────────────────────────────────────────
 def suggest_clean_column(raw_series: pd.Series, detected_type: str,
                          type_metrics: dict, spell_map: dict) -> pd.Series:
-    """
-    Returns a cleaned Series for the whole column at once.
-    Much faster than calling a per-cell function inside iterrows().
-    """
     s = raw_series.fillna("").astype(str).str.strip()
 
     if detected_type == "text":
@@ -233,8 +243,8 @@ def suggest_clean_column(raw_series: pd.Series, detected_type: str,
                 key = _RE_NON_ALPHA_KEY.sub('', w).lower()
                 if key in spell_map and spell_map[key]:
                     sg = spell_map[key]
-                    if w.isupper():       sg = sg.upper()
-                    elif w.istitle():     sg = sg.title()
+                    if w.isupper():   sg = sg.upper()
+                    elif w.istitle(): sg = sg.title()
                     corrected.append(sg)
                 else:
                     corrected.append(w)
@@ -280,11 +290,11 @@ def suggest_clean_column(raw_series: pd.Series, detected_type: str,
             return val
         return s.apply(clean_phone)
 
-    return s  # passthrough for unknown types
+    return s
 
 
 # ─────────────────────────────────────────────
-# MAIN ROUTE
+# EXISTING ROUTE  — untouched
 # ─────────────────────────────────────────────
 @app.route("/parse-excel", methods=["POST"])
 def parse_excel():
@@ -321,13 +331,11 @@ def parse_excel():
         column_diagnostics = {}
         layout_shifts      = []
         spell_maps         = {}
-        col_types          = {}   # col → detected_type
-        col_metrics        = {}   # col → type_metrics
+        col_types          = {}
+        col_metrics        = {}
 
-        # ── Single pass: diagnostics per column ──────────────────────────
         for i, col in enumerate(headers):
             series   = df[col]
-            # Build plain list once — reused for type detection & spellcheck
             col_vals = (
                 series.dropna()
                       .astype(str)
@@ -353,11 +361,11 @@ def parse_excel():
             col_types[col]   = detected_type
             col_metrics[col] = type_metrics
 
-            typos      = []
-            spell_map  = {}
+            typos     = []
+            spell_map = {}
             if detected_type == "text" and col_vals:
-                typos      = find_column_typos(pd.Series(col_vals))
-                spell_map  = {t["original"]: t["suggestion"] for t in typos}
+                typos     = find_column_typos(pd.Series(col_vals))
+                spell_map = {t["original"]: t["suggestion"] for t in typos}
             spell_maps[col] = spell_map
 
             mistakes_found = {
@@ -380,11 +388,11 @@ def parse_excel():
                 mistakes_found["missing_leading_zeros"]      = type_metrics.get("missing_leading_zeros", "no")
                 mistakes_found["missing_leading_zeros_desc"] = type_metrics.get("desc", "")
             elif detected_type == "email":
-                mistakes_found["invalid_emails"]        = type_metrics.get("invalid_emails", "no")
-                mistakes_found["invalid_emails_desc"]   = type_metrics.get("invalid_emails_desc", "")
-                mistakes_found["invalid_email_list"]    = type_metrics.get("invalid_email_list", [])
-                mistakes_found["mixed_case_emails"]     = type_metrics.get("mixed_case_emails", "no")
-                mistakes_found["mixed_case_emails_desc"]= type_metrics.get("mixed_case_emails_desc", "")
+                mistakes_found["invalid_emails"]         = type_metrics.get("invalid_emails", "no")
+                mistakes_found["invalid_emails_desc"]    = type_metrics.get("invalid_emails_desc", "")
+                mistakes_found["invalid_email_list"]     = type_metrics.get("invalid_email_list", [])
+                mistakes_found["mixed_case_emails"]      = type_metrics.get("mixed_case_emails", "no")
+                mistakes_found["mixed_case_emails_desc"] = type_metrics.get("mixed_case_emails_desc", "")
             elif detected_type == "text":
                 mistakes_found["inconsistent_formatting"]      = type_metrics.get("inconsistent_formatting", "no")
                 mistakes_found["inconsistent_formatting_desc"] = type_metrics.get("casing_desc", "")
@@ -395,7 +403,6 @@ def parse_excel():
                 "mistakes_found": mistakes_found
             }
 
-        # ── Build suggested-clean rows (vectorised, one pass per column) ──
         cleaned_cols = {}
         for col in headers:
             cleaned_cols[col] = suggest_clean_column(
@@ -405,13 +412,11 @@ def parse_excel():
                 spell_maps[col]
             ).tolist()
 
-        # Transpose: list-of-dicts from dict-of-lists
         suggested_rows = [
             {col: cleaned_cols[col][ri] for col in headers}
             for ri in range(total_rows)
         ]
 
-        # Legacy pipe-joined rows
         df_cleaned = df.fillna("")
         clean_rows = [
             "|".join(str(v) for v in row)
@@ -433,6 +438,267 @@ def parse_excel():
         return jsonify({"error": f"Internal MasterX workflow crash: {str(e)}"}), 500
 
 
+# ─────────────────────────────────────────────
+# HELPERS FOR /extract-to-excel
+# ─────────────────────────────────────────────
+
+def extract_text_from_pdf(raw: bytes) -> str:
+    """Extract all text from a PDF using pdfplumber."""
+    if not PDF_AVAILABLE:
+        raise RuntimeError("pdfplumber is not installed.")
+    text_parts = []
+    with pdfplumber.open(io.BytesIO(raw)) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text_parts.append(page_text)
+    return "\n".join(text_parts)
+
+
+def extract_text_from_docx(raw: bytes) -> str:
+    """Extract all text from a Word .docx file."""
+    if not DOCX_AVAILABLE:
+        raise RuntimeError("python-docx is not installed.")
+    doc = DocxDocument(io.BytesIO(raw))
+    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+    # Also pull text from tables
+    for table in doc.tables:
+        for row in table.rows:
+            row_text = "\t".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+            if row_text:
+                paragraphs.append(row_text)
+    return "\n".join(paragraphs)
+
+
+def extract_text_from_pptx(raw: bytes) -> str:
+    """Extract all text from a PowerPoint .pptx file."""
+    if not PPTX_AVAILABLE:
+        raise RuntimeError("python-pptx is not installed.")
+    prs = Presentation(io.BytesIO(raw))
+    lines = []
+    for slide_num, slide in enumerate(prs.slides, 1):
+        lines.append(f"[Slide {slide_num}]")
+        for shape in slide.shapes:
+            if hasattr(shape, "text") and shape.text.strip():
+                lines.append(shape.text.strip())
+    return "\n".join(lines)
+
+
+def extract_text_from_image(raw: bytes) -> str:
+    """Use OCR (pytesseract) to pull text from an image."""
+    if not OCR_AVAILABLE:
+        raise RuntimeError("Pillow and pytesseract are not installed.")
+    img = Image.open(io.BytesIO(raw))
+    return pytesseract.image_to_string(img)
+
+
+def extract_text_from_txt(raw: bytes) -> str:
+    """Decode a plain text file."""
+    for enc in ("utf-8", "latin-1", "cp1252"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def extract_text_from_spreadsheet(raw: bytes, fname: str) -> str:
+    """Read an existing spreadsheet and return it as tab-separated text."""
+    if fname.endswith('.csv'):
+        df = pd.read_csv(io.BytesIO(raw), dtype=str)
+    elif fname.endswith('.tsv'):
+        df = pd.read_csv(io.BytesIO(raw), sep='\t', dtype=str)
+    elif fname.endswith('.ods'):
+        df = pd.read_excel(io.BytesIO(raw), dtype=str, engine='odf')
+    else:
+        df = pd.read_excel(io.BytesIO(raw), dtype=str)
+    return df.to_csv(index=False)
+
+
+def parse_text_to_dataframe(text: str) -> pd.DataFrame:
+    """
+    Intelligently turn raw extracted text into a structured DataFrame.
+
+    Strategy (in order):
+    1. If text looks like CSV/TSV already, parse it directly.
+    2. Try to detect a table-like structure (consistent delimiters per line).
+    3. Fall back: split each non-empty line into a single-column 'Content' table.
+    """
+    lines = [l for l in text.splitlines() if l.strip()]
+    if not lines:
+        return pd.DataFrame({"Content": ["(No text could be extracted from this file.)"]})
+
+    # ── Try CSV/TSV detection ──
+    first_line = lines[0]
+    if '\t' in first_line and first_line.count('\t') >= 1:
+        try:
+            df = pd.read_csv(io.StringIO(text), sep='\t', dtype=str)
+            if len(df.columns) > 1:
+                return df.fillna("")
+        except Exception:
+            pass
+
+    if ',' in first_line and first_line.count(',') >= 1:
+        try:
+            df = pd.read_csv(io.StringIO(text), dtype=str)
+            if len(df.columns) > 1:
+                return df.fillna("")
+        except Exception:
+            pass
+
+    # ── Try to detect a consistent column structure ──
+    # Look for lines where words are separated by 2+ spaces (common in PDF tables)
+    col_counts = []
+    for line in lines[:20]:  # sample first 20 lines
+        parts = re.split(r'\s{2,}', line.strip())
+        col_counts.append(len(parts))
+
+    if col_counts:
+        most_common_cols = max(set(col_counts), key=col_counts.count)
+        consistent = sum(1 for c in col_counts if c == most_common_cols)
+        # If more than half the lines agree on column count, treat as table
+        if most_common_cols > 1 and consistent / len(col_counts) > 0.5:
+            rows = []
+            for line in lines:
+                parts = re.split(r'\s{2,}', line.strip())
+                # Pad or trim to match column count
+                while len(parts) < most_common_cols:
+                    parts.append("")
+                rows.append(parts[:most_common_cols])
+
+            if rows:
+                header = rows[0]
+                data   = rows[1:]
+                # If header looks like real column names (not just numbers/dates), use it
+                if all(not re.match(r'^\d+$', h) for h in header):
+                    df = pd.DataFrame(data, columns=header)
+                else:
+                    df = pd.DataFrame(rows, columns=[f"Column {i+1}" for i in range(most_common_cols)])
+                return df.fillna("")
+
+    # ── Fallback: one row per line, single column ──
+    return pd.DataFrame({"Content": lines})
+
+
+# ─────────────────────────────────────────────
+# NEW ROUTE  — independent from /parse-excel
+# ─────────────────────────────────────────────
+@app.route("/extract-to-excel", methods=["POST"])
+def extract_to_excel():
+    """
+    Accepts any file type (PDF, DOCX, PPTX, image, TXT, CSV, XLSX, etc.),
+    extracts the text/data content, structures it into a DataFrame,
+    and returns a clean .xlsx file as a download.
+    """
+    try:
+        if "file" not in request.files:
+            return jsonify({"error": "No file provided. Send a file with key 'file'."}), 400
+
+        file = request.files["file"]
+        if not file.filename:
+            return jsonify({"error": "File has no name."}), 400
+
+        fname = file.filename.lower()
+        raw   = file.read()
+
+        # ── Route to the right extractor based on file extension ──
+        if fname.endswith('.pdf'):
+            text = extract_text_from_pdf(raw)
+            df   = parse_text_to_dataframe(text)
+
+        elif fname.endswith('.docx'):
+            text = extract_text_from_docx(raw)
+            df   = parse_text_to_dataframe(text)
+
+        elif fname.endswith('.doc'):
+            return jsonify({"error": "Legacy .doc files are not supported. Please convert to .docx first."}), 415
+
+        elif fname.endswith('.pptx'):
+            text = extract_text_from_pptx(raw)
+            df   = parse_text_to_dataframe(text)
+
+        elif fname.endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp', '.gif')):
+            text = extract_text_from_image(raw)
+            df   = parse_text_to_dataframe(text)
+
+        elif fname.endswith('.txt') or fname.endswith('.md') or fname.endswith('.log'):
+            text = extract_text_from_txt(raw)
+            df   = parse_text_to_dataframe(text)
+
+        elif fname.endswith(('.xlsx', '.xls', '.csv', '.tsv', '.ods')):
+            # Already structured — just clean it up
+            text = extract_text_from_spreadsheet(raw, fname)
+            df   = parse_text_to_dataframe(text)
+
+        elif fname.endswith('.json'):
+            try:
+                data = json.loads(raw.decode('utf-8'))
+                if isinstance(data, list):
+                    df = pd.DataFrame(data).fillna("")
+                elif isinstance(data, dict):
+                    df = pd.DataFrame([data]).fillna("")
+                else:
+                    df = pd.DataFrame({"Content": [str(data)]})
+            except Exception as e:
+                return jsonify({"error": f"Could not parse JSON: {str(e)}"}), 400
+
+        else:
+            # Unknown type — try plain text decode as last resort
+            try:
+                text = extract_text_from_txt(raw)
+                df   = parse_text_to_dataframe(text)
+            except Exception:
+                return jsonify({
+                    "error": f"File type '{fname.split('.')[-1]}' is not supported."
+                }), 415
+
+        # ── Guard: empty result ──
+        if df.empty or (len(df.columns) == 0):
+            return jsonify({"error": "Could not extract any structured content from this file."}), 422
+
+        # ── Write to Excel in memory and return as download ──
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Extracted Data')
+
+            # Auto-size columns for readability
+            worksheet = writer.sheets['Extracted Data']
+            for col_cells in worksheet.columns:
+                max_len = 0
+                col_letter = col_cells[0].column_letter
+                for cell in col_cells:
+                    try:
+                        cell_len = len(str(cell.value)) if cell.value else 0
+                        if cell_len > max_len:
+                            max_len = cell_len
+                    except Exception:
+                        pass
+                adjusted_width = min(max_len + 4, 60)
+                worksheet.column_dimensions[col_letter].width = adjusted_width
+
+        output.seek(0)
+
+        # ── Build a clean output filename ──
+        base_name = re.sub(r'\.[^.]+$', '', file.filename)  # strip extension
+        safe_name = re.sub(r'[^\w\-]', '_', base_name)
+        download_name = f"{safe_name}_extracted.xlsx"
+
+        return send_file(
+            output,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=download_name
+        )
+
+    except RuntimeError as e:
+        return jsonify({"error": f"Missing library: {str(e)}"}), 500
+    except Exception as e:
+        return jsonify({"error": f"Extraction failed: {str(e)}"}), 500
+
+
+# ─────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
