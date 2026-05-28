@@ -1,7 +1,14 @@
-import io, json, os, re, datetime
+import subprocess, sys, io, json, os, re, datetime
 import pandas as pd
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
+
+# Install tesseract at startup if not present
+try:
+    subprocess.run(["tesseract", "--version"], check=True, capture_output=True)
+except Exception:
+    subprocess.run(["apt-get", "update"], check=True)
+    subprocess.run(["apt-get", "install", "-y", "tesseract-ocr"], check=True)
 
 # ── New imports for /extract-to-excel ──
 try:
@@ -488,6 +495,7 @@ def extract_text_from_image(raw: bytes) -> str:
     """Use OCR (pytesseract) to pull text from an image."""
     if not OCR_AVAILABLE:
         raise RuntimeError("Pillow and pytesseract are not installed.")
+    pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
     img = Image.open(io.BytesIO(raw))
     return pytesseract.image_to_string(img)
 
