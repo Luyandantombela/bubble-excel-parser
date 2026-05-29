@@ -82,7 +82,6 @@ _TEXT_NUMBERS = {
 def find_column_typos(series_str):
     if SPELLCHECK_AVAILABLE:
         found = {}
-        # Sample max 300 values for speed
         for val in list(series_str)[:300]:
             clean_text = _RE_NON_ALPHA.sub('', val)
             words = [w.lower() for w in clean_text.split() if len(w) > 2]
@@ -120,7 +119,6 @@ def analyze_exclusive_type(values: list):
     if filled_count == 0:
         return "text", {}
 
-    # Sample for speed on large columns
     sample = values[:500]
     sample_count = len(sample)
 
@@ -480,7 +478,6 @@ def extract_pdf_as_dataframe(raw: bytes) -> pd.DataFrame:
             if not table:
                 continue
 
-            # Build a word->y lookup for OCR fallback
             words_by_text = {}
             for w in page.extract_words():
                 words_by_text.setdefault(w["text"][:8], w)
@@ -497,17 +494,14 @@ def extract_pdf_as_dataframe(raw: bytes) -> pd.DataFrame:
                     headers = clean
                     continue
 
-                # Check for garbled cells
                 row_text = " ".join(c for c in clean if c)
                 if _is_garbled(row_text) and OCR_AVAILABLE:
-                    # Find y position via a clean cell value
                     known = next((c for c in clean if c and not _is_garbled(c) and len(c) > 4), None)
                     if known:
                         match = words_by_text.get(known[:8])
                         if match:
                             ocr_line = _ocr_row_text(page, match["top"], match["bottom"])
                             if ocr_line:
-                                # Replace garbled cells with OCR text in the description cell
                                 fixed = []
                                 replaced = False
                                 for c in clean:
@@ -528,7 +522,6 @@ def extract_pdf_as_dataframe(raw: bytes) -> pd.DataFrame:
         col_count = len(headers) if headers else max(len(r) for r in all_rows)
         padded = [r + [""] * (col_count - len(r)) for r in all_rows]
         df = pd.DataFrame(padded, columns=headers if headers else [f"Column {i+1}" for i in range(col_count)])
-        # Count garbled cells across the whole dataframe
         garbled_count = sum(
             1 for col in df.columns
             for val in df[col].astype(str)
@@ -578,16 +571,83 @@ def extract_text_from_pptx(raw: bytes) -> str:
     return "\n".join(lines)
 
 
+# ── Image OCR: bounding-box table reconstruction ──────────────────────────────
+def _tsv_to_table_text(tsv_df) -> str:
+    """Convert pytesseract TSV bounding-box data into tab-separated rows."""
+    # Drop empty or very low confidence words
+    tsv_df = tsv_df[tsv_df['conf'] > 10].copy()
+    tsv_df = tsv_df[tsv_df['text'].str.strip().astype(bool)]
+    if tsv_df.empty:
+        return ""
+
+    # Compute vertical centre of each word
+    tsv_df['mid_y'] = tsv_df['top'] + tsv_df['height'] / 2
+    tsv_df = tsv_df.sort_values(['mid_y', 'left'])
+
+    # Group words into rows — words within 12px vertically go in the same row
+    rows = []
+    current_row = []
+    current_y = None
+    for _, word in tsv_df.iterrows():
+        if current_y is None or abs(word['mid_y'] - current_y) <= 12:
+            current_row.append(word)
+            current_y = word['mid_y'] if current_y is None else (current_y + word['mid_y']) / 2
+        else:
+            rows.append(current_row)
+            current_row = [word]
+            current_y = word['mid_y']
+    if current_row:
+        rows.append(current_row)
+
+    if not rows:
+        return ""
+
+    # Detect column boundaries from the header row's word centres
+    header_words = rows[0]
+    col_centres = sorted([w['left'] + w['width'] / 2 for w in header_words])
+
+    def assign_col(left, width, centres):
+        centre = left + width / 2
+        return min(range(len(centres)), key=lambda i: abs(centres[i] - centre))
+
+    num_cols = len(col_centres)
+    text_rows = []
+    for row_words in rows:
+        cells = [''] * num_cols
+        for w in row_words:
+            col_idx = assign_col(w['left'], w['width'], col_centres)
+            cells[col_idx] = (cells[col_idx] + ' ' + str(w['text'])).strip()
+        text_rows.append('\t'.join(cells))
+
+    return '\n'.join(text_rows)
+
+
 def extract_text_from_image(raw: bytes) -> str:
+    """Fast greyscale OCR with bounding-box table reconstruction."""
     if not OCR_AVAILABLE:
         raise RuntimeError("Pillow/pytesseract not installed.")
-    img = Image.open(io.BytesIO(raw))
-    # Resize large images for speed — OCR doesn't need 4K resolution
-    max_dim = 2000
+
+    img = Image.open(io.BytesIO(raw)).convert("L")  # greyscale = faster + more accurate
+
+    # Resize only if very large
+    max_dim = 1800
     if max(img.size) > max_dim:
         ratio = max_dim / max(img.size)
         img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
-    return pytesseract.image_to_string(img)
+
+    # Use TSV output to get word positions for column reconstruction
+    tsv_df = pytesseract.image_to_data(
+        img,
+        output_type=pytesseract.Output.DATAFRAME,
+        config='--psm 6'
+    )
+    result = _tsv_to_table_text(tsv_df)
+
+    # Fallback to plain string if TSV reconstruction produced nothing
+    if not result.strip():
+        result = pytesseract.image_to_string(img, config='--psm 6')
+
+    return result
 
 
 def extract_text_from_txt(raw: bytes) -> str:
@@ -701,6 +761,8 @@ def extract_to_excel():
         elif fname.endswith('.pptx'):
             df = parse_text_to_dataframe(extract_text_from_pptx(raw))
         elif fname.endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp', '.gif')):
+            if not OCR_AVAILABLE:
+                return jsonify({"error": "OCR is not available on this server. Tesseract is not installed."}), 503
             df = parse_text_to_dataframe(extract_text_from_image(raw))
         elif fname.endswith(('.txt', '.md', '.log')):
             df = parse_text_to_dataframe(extract_text_from_txt(raw))
