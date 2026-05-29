@@ -11,4 +11,4 @@ RUN pip install -r requirements.txt
 
 COPY . .
 
-CMD ["gunicorn", "excel_step1:app"]
+CMD ["gunicorn", "--config", "gunicorn.conf.py", "excel_step1:app"]
