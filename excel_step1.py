@@ -571,83 +571,44 @@ def extract_text_from_pptx(raw: bytes) -> str:
     return "\n".join(lines)
 
 
-# ── Image OCR: bounding-box table reconstruction ──────────────────────────────
-def _tsv_to_table_text(tsv_df) -> str:
-    """Convert pytesseract TSV bounding-box data into tab-separated rows."""
-    # Drop empty or very low confidence words
-    tsv_df = tsv_df[tsv_df['conf'] > 10].copy()
-    tsv_df = tsv_df[tsv_df['text'].str.strip().astype(bool)]
-    if tsv_df.empty:
-        return ""
-
-    # Compute vertical centre of each word
-    tsv_df['mid_y'] = tsv_df['top'] + tsv_df['height'] / 2
-    tsv_df = tsv_df.sort_values(['mid_y', 'left'])
-
-    # Group words into rows — words within 12px vertically go in the same row
-    rows = []
-    current_row = []
-    current_y = None
-    for _, word in tsv_df.iterrows():
-        if current_y is None or abs(word['mid_y'] - current_y) <= 12:
-            current_row.append(word)
-            current_y = word['mid_y'] if current_y is None else (current_y + word['mid_y']) / 2
-        else:
-            rows.append(current_row)
-            current_row = [word]
-            current_y = word['mid_y']
-    if current_row:
-        rows.append(current_row)
-
-    if not rows:
-        return ""
-
-    # Detect column boundaries from the header row's word centres
-    header_words = rows[0]
-    col_centres = sorted([w['left'] + w['width'] / 2 for w in header_words])
-
-    def assign_col(left, width, centres):
-        centre = left + width / 2
-        return min(range(len(centres)), key=lambda i: abs(centres[i] - centre))
-
-    num_cols = len(col_centres)
-    text_rows = []
-    for row_words in rows:
-        cells = [''] * num_cols
-        for w in row_words:
-            col_idx = assign_col(w['left'], w['width'], col_centres)
-            cells[col_idx] = (cells[col_idx] + ' ' + str(w['text'])).strip()
-        text_rows.append('\t'.join(cells))
-
-    return '\n'.join(text_rows)
-
-
-def extract_text_from_image(raw: bytes) -> str:
-    """Fast greyscale OCR with bounding-box table reconstruction."""
+# ── Image → searchable PDF → pdfplumber pipeline ─────────────────────────────
+def extract_dataframe_from_image(raw: bytes):
+    """
+    Best-quality image table extraction:
+    1. Preprocess image (greyscale, resize)
+    2. Use Tesseract to produce a SEARCHABLE PDF (real text layer, not pixels)
+    3. Feed that PDF straight into the proven pdfplumber pipeline
+    4. Fallback to plain OCR string if pdfplumber finds no table
+    """
     if not OCR_AVAILABLE:
         raise RuntimeError("Pillow/pytesseract not installed.")
+    if not PDF_AVAILABLE:
+        raise RuntimeError("pdfplumber not installed.")
 
-    img = Image.open(io.BytesIO(raw)).convert("L")  # greyscale = faster + more accurate
-
-    # Resize only if very large
+    # Step 1 — preprocess
+    img = Image.open(io.BytesIO(raw)).convert("L")  # greyscale
     max_dim = 1800
     if max(img.size) > max_dim:
         ratio = max_dim / max(img.size)
         img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
 
-    # Use TSV output to get word positions for column reconstruction
-    tsv_df = pytesseract.image_to_data(
-        img,
-        output_type=pytesseract.Output.DATAFRAME,
-        config='--psm 6'
+    # Step 2 — Tesseract writes a real text layer into a PDF
+    # image_to_pdf_or_hocr returns raw PDF bytes with embedded selectable text
+    searchable_pdf_bytes = pytesseract.image_to_pdf_or_hocr(
+        img, extension='pdf', config='--psm 6'
     )
-    result = _tsv_to_table_text(tsv_df)
 
-    # Fallback to plain string if TSV reconstruction produced nothing
-    if not result.strip():
-        result = pytesseract.image_to_string(img, config='--psm 6')
+    # Step 3 — run through the existing proven PDF extractor
+    df, warning = extract_pdf_as_dataframe(searchable_pdf_bytes)
 
-    return result
+    # Step 4 — sanity check: if pdfplumber only got 1 column, the text layer
+    # probably isn't tabular enough; fall back to plain OCR → parse_text
+    if len(df.columns) <= 1:
+        plain_text = pytesseract.image_to_string(img, config='--psm 6')
+        df = parse_text_to_dataframe(plain_text)
+        warning = "Table structure could not be auto-detected. Content extracted as plain text."
+
+    return df, warning
 
 
 def extract_text_from_txt(raw: bytes) -> str:
@@ -763,7 +724,7 @@ def extract_to_excel():
         elif fname.endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp', '.gif')):
             if not OCR_AVAILABLE:
                 return jsonify({"error": "OCR is not available on this server. Tesseract is not installed."}), 503
-            df = parse_text_to_dataframe(extract_text_from_image(raw))
+            df, warning = extract_dataframe_from_image(raw)
         elif fname.endswith(('.txt', '.md', '.log')):
             df = parse_text_to_dataframe(extract_text_from_txt(raw))
         elif fname.endswith(('.xlsx', '.xls', '.csv', '.tsv', '.ods')):
